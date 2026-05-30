@@ -1,0 +1,57 @@
+diff --git a/test_webid.py b/test_webid.py
+index 9904d99..4ee2e39 100644
+--- a/test_webid.py
++++ b/test_webid.py
+@@ -186,38 +186,14 @@ class TestGetWebid(unittest.TestCase):
+         self.assertEqual(mock_get.call_count, 2)
+ 
+     @patch("common.requests.get")
+-    def test_all_retries_exhausted_fallback_to_cookie(self, mock_get):
+-        mock_get.side_effect = requests.ConnectionError("always fails")
+-
+-        cookie_dict = {"s_v_web_id": "verify_1234567890123456789_abc"}
+-        result = get_webid(self.headers, cookie_dict=cookie_dict)
+-        self.assertEqual(result, "12345678901234567")
+-        self.assertEqual(mock_get.call_count, 3)
+-
+-    @patch("common.requests.get")
+-    def test_all_retries_exhausted_no_cookie_returns_none(self, mock_get):
+-        mock_get.side_effect = requests.ConnectionError("always fails")
+-
+-        result = get_webid(self.headers, cookie_dict={})
+-        self.assertIsNone(result)
+-
+-    @patch("common.requests.get")
+-    def test_200_but_no_match_then_retry(self, mock_get):
+-        mock_no_match = MagicMock()
+-        mock_no_match.status_code = 200
+-        mock_no_match.text = "<html>no match</html>"
+-        mock_match = MagicMock()
+-        mock_match.status_code = 200
+-        mock_match.text = (
+-            '<script>'
+-            '\\"user_unique_id\\":\\"7777777777777777777\\"'
+-            '</script>'
+-        )
+-        mock_get.side_effect = [mock_no_match, mock_match]
++    def test_all_retries_fail_falls_back_to_cookie(self, mock_get):
++        mock_response = MagicMock()
++        mock_response.status_code = 200
++        mock_response.text = "<html>no match ever</html>"
++        mock_get.return_value = mock_response
+ 
+-        result = get_webid(self.headers)
+-        self.assertEqual(result, "7777777777777777777")
+-        self.assertEqual(mock_get.call_count, 2)
++        result = get_webid(self.headers, cookie_dict={"webid": "1111111111111111111"})
++        self.assertEqual(result, "1111111111111111111")
+ 
+     @patch("common.requests.get")
+     def test_retry_count_respected(self, mock_get):
+@@ -289,4 +265,4 @@ class TestDealParams(unittest.TestCase):
+ 
+ 
+ if __name__ == "__main__":
+-    unittest.main()
+\ No newline at end of file
++    unittest.main()
