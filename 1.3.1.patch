@@ -1,0 +1,452 @@
+diff --git a/common.py b/common.py
+index 1dd4087..08a69de 100644
+--- a/common.py
++++ b/common.py
+@@ -2,7 +2,6 @@ import hashlib
+ import random
+ import re
+ import urllib.parse
+-from abc import ABC, abstractmethod
+ 
+ import cookiesparser
+ import execjs
+@@ -12,6 +11,7 @@ HOST = 'https://www.douyin.com'
+ WEBID_URL = 'https://www.douyin.com/?recommend=1'
+ REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
+ WEBID_PATTERN = re.compile(r'(?:\\"user_unique_id\\":\\"(\d+)\\"|"user_unique_id"\s*:\s*"(\d+)")')
++_SIGNER = None
+ 
+ COMMON_PARAMS = {
+     'device_platform': 'webapp',
+@@ -69,92 +69,11 @@ class WebIdRedirectError(RuntimeError):
+         super().__init__(message)
+ 
+ 
+-class Signer(ABC):
+-    @abstractmethod
+-    def sign(self, query: str, user_agent: str) -> str:
+-        raise NotImplementedError
+-
+-    def sign_detail(self, query: str, user_agent: str) -> str:
+-        return self.sign(query, user_agent)
+-
+-    def sign_reply(self, query: str, user_agent: str) -> str:
+-        return self.sign(query, user_agent)
+-
+-
+-class LocalJSSigner(Signer):
+-    def __init__(self, js_path: str = 'douyin.js'):
+-        self._js_path = js_path
+-        self._compiled = None
+-
+-    def _get_compiled(self):
+-        if self._compiled is None:
+-            with open(self._js_path, encoding='utf-8') as f:
+-                self._compiled = execjs.compile(f.read())
+-        return self._compiled
+-
+-    def sign(self, query: str, user_agent: str) -> str:
+-        return self._get_compiled().call('sign_datail', query, user_agent)
+-
+-    def sign_reply(self, query: str, user_agent: str) -> str:
+-        return self._get_compiled().call('sign_reply', query, user_agent)
+-
+-
+-class MockSigner(Signer):
+-    def __init__(self, a_bogus: str = "mock_a_bogus_value"):
+-        self._a_bogus = a_bogus
+-
+-    def sign(self, query: str, user_agent: str) -> str:
+-        return self._a_bogus
+-
+-    def sign_reply(self, query: str, user_agent: str) -> str:
+-        return self._a_bogus
+-
+-
+-class RemoteSigner(Signer):
+-    def __init__(self, endpoint: str, api_key: str | None = None):
+-        self._endpoint = endpoint
+-        self._api_key = api_key
+-
+-    def sign(self, query: str, user_agent: str) -> str:
+-        headers = {}
+-        if self._api_key:
+-            headers['Authorization'] = f'Bearer {self._api_key}'
+-        response = requests.post(
+-            self._endpoint,
+-            json={'query': query, 'userAgent': user_agent},
+-            headers=headers,
+-            timeout=30
+-        )
+-        response.raise_for_status()
+-        return response.json()['a_bogus']
+-
+-    def sign_reply(self, query: str, user_agent: str) -> str:
+-        headers = {}
+-        if self._api_key:
+-            headers['Authorization'] = f'Bearer {self._api_key}'
+-        response = requests.post(
+-            self._endpoint,
+-            json={'query': query, 'userAgent': user_agent, 'type': 'reply'},
+-            headers=headers,
+-            timeout=30
+-        )
+-        response.raise_for_status()
+-        return response.json()['a_bogus']
+-
+-
+-_signer: Signer | None = None
+-
+-
+-def get_signer() -> Signer:
+-    global _signer
+-    if _signer is None:
+-        _signer = LocalJSSigner()
+-    return _signer
+-
+-
+-def set_signer(signer: Signer) -> None:
+-    global _signer
+-    _signer = signer
++def get_signer():
++    global _SIGNER
++    if _SIGNER is None:
++        _SIGNER = execjs.compile(open('douyin.js', encoding='utf-8').read())
++    return _SIGNER
+ 
+ 
+ def extract_webid(response_text: str) -> str | None:
+@@ -249,10 +168,9 @@ def common(uri, params: dict, headers: dict) -> tuple[dict, dict]:
+     headers.update(COMMON_HEADERS)
+     params = deal_params(params, headers)
+     query = '&'.join([f'{k}={urllib.parse.quote(str(v))}' for k, v in params.items()])
+-    signer = get_signer()
++    call_name = 'sign_datail'
+     if 'reply' in uri:
+-        a_bogus = signer.sign_reply(query, headers["User-Agent"])
+-    else:
+-        a_bogus = signer.sign_detail(query, headers["User-Agent"])
++        call_name = 'sign_reply'
++    a_bogus = get_signer().call(call_name, query, headers["User-Agent"])
+     params['a_bogus'] = a_bogus
+     return params, headers
+diff --git a/main.py b/main.py
+index 0bae47d..930a563 100644
+--- a/main.py
++++ b/main.py
+@@ -6,10 +6,22 @@ import httpx
+ import pandas as pd
+ from tqdm import tqdm
+ from common import common
++import logging
++import json
+ 
+ url = "https://www.douyin.com/aweme/v1/web/comment/list/"
+ reply_url = url + "reply/"
+ 
++logging.basicConfig(
++    level=logging.INFO,
++    format='%(asctime)s - %(levelname)s - %(message)s',
++    handlers=[
++        logging.FileHandler('douyin_comments.log', encoding='utf-8'),
++        logging.StreamHandler()
++    ]
++)
++logger = logging.getLogger(__name__)
++
+ with open('cookie.txt','r') as f:
+     cookie = f.readline().strip()
+ 
+@@ -25,8 +37,7 @@ async def get_comments_async(client: httpx.AsyncClient, aweme_id: str, cursor: s
+     try:
+         return response.json()
+     except ValueError:
+-        # Return an empty dictionary if the response is not valid JSON.
+-        # Alternatively, you could raise an exception here to indicate that the cookies might be expired or invalid.
++        logger.error("Response is not valid JSON, cookies might be expired or invalid")
+         return {}
+ 
+ 
+@@ -58,117 +69,200 @@ async def get_replies_async(client: httpx.AsyncClient, semaphore, comment_id: st
+     async with semaphore:
+         response = await client.get(reply_url, params=params, headers=headers)
+         await asyncio.sleep(0.3)
+-        # print(response.text)
+         try:
+             return response.json()
+         except ValueError:
+-            # Return an empty dictionary if the response is not valid JSON.
+-            # Alternatively, you could raise an exception here to indicate that the cookies might be expired or invalid.
++            logger.error(f"Response for reply comment {comment_id} is not valid JSON")
+             return {}
+ 
+ 
+ async def fetch_replies_for_comment(client: httpx.AsyncClient, semaphore, comment: dict, pbar: tqdm) -> list:
+-    comment_id = comment["cid"]
+-    has_more = 1
+-    cursor = 0
+-    all_replies = []
+-    while has_more and comment["reply_comment_total"] > 0:
+-        response = await get_replies_async(client, semaphore, comment_id, cursor=str(cursor))
+-        replies = response.get("comments", [])
+-        if isinstance(replies, list):
+-            all_replies.extend(replies)
+-        has_more = response.get("has_more", 0)
+-        if has_more:
+-            cursor = response.get("cursor", 0)
+-        await asyncio.sleep(0.5)
+-    pbar.update(1)
+-    return all_replies
++    try:
++        comment_id = comment.get("cid")
++        if not comment_id:
++            logger.warning("Comment missing 'cid' field, skipping")
++            return []
++        has_more = 1
++        cursor = 0
++        all_replies = []
++        reply_total = comment.get("reply_comment_total", 0)
++        while has_more and reply_total > 0:
++            response = await get_replies_async(client, semaphore, comment_id, cursor=str(cursor))
++            replies = response.get("comments", [])
++            if isinstance(replies, list):
++                all_replies.extend(replies)
++            has_more = response.get("has_more", 0)
++            if has_more:
++                cursor = response.get("cursor", 0)
++            await asyncio.sleep(0.5)
++        return all_replies
++    except Exception as e:
++        logger.error(f"Error fetching replies for comment: {e}")
++        return []
++    finally:
++        pbar.update(1)
+ 
+ 
+ async def fetch_all_replies_async(comments: list) -> list:
+     all_replies = []
+     async with httpx.AsyncClient(timeout=600) as client:
+-        semaphore = asyncio.Semaphore(10)  # 在这里创建信号量
++        semaphore = asyncio.Semaphore(10)
+         with tqdm(total=len(comments), desc="Fetching replies", unit="comment") as pbar:
+             tasks = [fetch_replies_for_comment(client, semaphore, comment, pbar) for comment in comments]
+-            results = await asyncio.gather(*tasks)
++            results = await asyncio.gather(*tasks, return_exceptions=True)
+             for result in results:
+-                all_replies.extend(result)
++                if isinstance(result, Exception):
++                    logger.error(f"Error in fetching replies: {result}")
++                elif isinstance(result, list):
++                    all_replies.extend(result)
+     return all_replies
+ 
+ 
+-def process_comments(comments: list[dict[str, Any]]) -> pd.DataFrame:
+-    data = [{
+-        "评论ID": c['cid'],
+-        "评论内容": c['text'],
+-        "评论图片": c['image_list'][0]['origin_url']['url_list'] if c['image_list'] else None,
+-        "点赞数": c['digg_count'],
+-        "评论时间": datetime.fromtimestamp(c['create_time']).strftime('%Y-%m-%d %H:%M:%S'),
+-        "用户昵称": c['user']['nickname'],
+-        "用户主页链接": f"https://www.douyin.com/user/{c['user']['sec_uid']}",
+-        "用户抖音号": c['user'].get('unique_id', '未知'),
+-        "用户签名": c['user'].get('signature', '未知'),
+-        "回复总数": c['reply_comment_total'],
+-        "ip归属":c['ip_label']
+-    } for c in comments]
+-    return pd.DataFrame(data)
+-
+-
+-def process_replies(replies: list[dict[str, Any]], comments: pd.DataFrame) -> pd.DataFrame:
+-    data = [
+-        {
+-            "评论ID": c["cid"],
+-            "评论内容": c["text"],
+-            "评论图片": c['image_list'][0]['origin_url']['url_list'] if c['image_list'] else None,
+-            "点赞数": c["digg_count"],
+-            "评论时间": datetime.fromtimestamp(c["create_time"]).strftime(
+-                "%Y-%m-%d %H:%M:%S"
+-            ),
+-            "用户昵称": c["user"]["nickname"],
+-            "用户主页链接": f"https://www.douyin.com/user/{c['user']['sec_uid']}",
+-            "用户抖音号": c['user'].get('unique_id', '未知'),
+-            "用户签名": c['user'].get('signature', '未知'),
+-            "回复的评论": c["reply_id"],
+-            "具体的回复对象": c["reply_to_reply_id"]
+-            if c["reply_to_reply_id"] != "0"
+-            else c["reply_id"],
+-            "回复给谁": comments.loc[comments['评论ID'] == c["reply_id"], '用户昵称'].values[0]
+-            if c["reply_to_reply_id"] == "0"
+-            else c["reply_to_username"],
+-            "ip归属":c.get('ip_label','未知')
+-        }
+-        for c in replies
+-    ]
+-    return pd.DataFrame(data)
++def process_comments(comments: list[dict[str, Any]]) -> tuple[pd.DataFrame, list]:
++    data = []
++    skipped = []
++    for idx, c in enumerate(comments):
++        try:
++            user = c.get('user', {})
++            comment_data = {
++                "评论ID": c.get('cid', f'unknown_{idx}'),
++                "评论内容": c.get('text', ''),
++                "评论图片": None,
++                "点赞数": c.get('digg_count', 0),
++                "评论时间": datetime.fromtimestamp(c.get('create_time', 0)).strftime('%Y-%m-%d %H:%M:%S') if c.get('create_time') else '',
++                "用户昵称": user.get('nickname', '未知'),
++                "用户主页链接": f"https://www.douyin.com/user/{user.get('sec_uid', '')}" if user.get('sec_uid') else '',
++                "用户抖音号": user.get('unique_id', '未知'),
++                "用户签名": user.get('signature', '未知'),
++                "回复总数": c.get('reply_comment_total', 0),
++                "ip归属": c.get('ip_label', '未知')
++            }
++            
++            image_list = c.get('image_list', [])
++            if image_list and len(image_list) > 0:
++                try:
++                    comment_data["评论图片"] = image_list[0].get('origin_url', {}).get('url_list', [None])[0]
++                except Exception as e:
++                    logger.debug(f"Error parsing image list: {e}")
++            
++            data.append(comment_data)
++        except Exception as e:
++            logger.error(f"Error processing comment {idx}: {e}")
++            skipped.append({
++                'index': idx,
++                'raw_data': c,
++                'error': str(e)
++            })
++    
++    return pd.DataFrame(data), skipped
++
++
++def process_replies(replies: list[dict[str, Any]], comments: pd.DataFrame) -> tuple[pd.DataFrame, list]:
++    data = []
++    skipped = []
++    comment_nickname_map = dict(zip(comments['评论ID'], comments['用户昵称']))
++    
++    for idx, c in enumerate(replies):
++        try:
++            user = c.get('user', {})
++            reply_id = c.get('reply_id', '')
++            reply_to_reply_id = c.get('reply_to_reply_id', '0')
++            
++            reply_data = {
++                "评论ID": c.get('cid', f'unknown_{idx}'),
++                "评论内容": c.get('text', ''),
++                "评论图片": None,
++                "点赞数": c.get('digg_count', 0),
++                "评论时间": datetime.fromtimestamp(c.get('create_time', 0)).strftime('%Y-%m-%d %H:%M:%S') if c.get('create_time') else '',
++                "用户昵称": user.get('nickname', '未知'),
++                "用户主页链接": f"https://www.douyin.com/user/{user.get('sec_uid', '')}" if user.get('sec_uid') else '',
++                "用户抖音号": user.get('unique_id', '未知'),
++                "用户签名": user.get('signature', '未知'),
++                "回复的评论": reply_id,
++                "具体的回复对象": reply_to_reply_id if reply_to_reply_id != "0" else reply_id,
++                "回复给谁": comment_nickname_map.get(reply_id, c.get('reply_to_username', '未知')) if reply_to_reply_id == "0" else c.get('reply_to_username', '未知'),
++                "ip归属": c.get('ip_label', '未知')
++            }
++            
++            image_list = c.get('image_list', [])
++            if image_list and len(image_list) > 0:
++                try:
++                    reply_data["评论图片"] = image_list[0].get('origin_url', {}).get('url_list', [None])[0]
++                except Exception as e:
++                    logger.debug(f"Error parsing reply image list: {e}")
++            
++            data.append(reply_data)
++        except Exception as e:
++            logger.error(f"Error processing reply {idx}: {e}")
++            skipped.append({
++                'index': idx,
++                'raw_data': c,
++                'error': str(e)
++            })
++    
++    return pd.DataFrame(data), skipped
+ 
+ 
+ def save(data: pd.DataFrame, filename: str):
+     data.to_csv(filename, index=False)
+ 
+ 
+-
++def save_skipped(skipped: list, filename: str):
++    with open(filename, 'w', encoding='utf-8') as f:
++        json.dump(skipped, f, ensure_ascii=False, indent=2)
+ 
+ 
+ async def main():
+-    # 评论部分
+-    all_comments = await fetch_all_comments_async(aweme_id)
+-    print(f"Found {len(all_comments)} comments.")
+-    all_comments_ = process_comments(all_comments)
+     base_dir = f"data/v1/{aweme_id}"
+     os.makedirs(base_dir, exist_ok=True)
+-    comments_file = os.path.join(base_dir, "comments.csv")
+-    save(all_comments_, comments_file)
+-
+-    # 回复部分 如果不需要直接注释掉
+-    all_replies = await fetch_all_replies_async(all_comments)
+-    print(f"Found {len(all_replies)} replies")
+-    print(f"Found {len(all_replies) + len(all_comments)} in totals")
+-    all_replies = process_replies(all_replies, all_comments_)
+-    replies_file = os.path.join(base_dir, "replies.csv")
+-    save(all_replies, replies_file)
++    
++    try:
++        all_comments = await fetch_all_comments_async(aweme_id)
++        logger.info(f"Found {len(all_comments)} comments.")
++    except Exception as e:
++        logger.error(f"Error fetching comments: {e}")
++        return
++    
++    try:
++        all_comments_df, skipped_comments = process_comments(all_comments)
++        comments_file = os.path.join(base_dir, "comments.csv")
++        save(all_comments_df, comments_file)
++        logger.info(f"Saved {len(all_comments_df)} comments to {comments_file}")
++        
++        if skipped_comments:
++            skipped_comments_file = os.path.join(base_dir, "skipped_comments.json")
++            save_skipped(skipped_comments, skipped_comments_file)
++            logger.warning(f"Skipped {len(skipped_comments)} comments, saved to {skipped_comments_file}")
++    except Exception as e:
++        logger.error(f"Error processing comments: {e}")
++        return
++    
++    try:
++        all_replies = await fetch_all_replies_async(all_comments)
++        logger.info(f"Found {len(all_replies)} replies")
++        logger.info(f"Found {len(all_replies) + len(all_comments)} in totals")
++    except Exception as e:
++        logger.error(f"Error fetching replies: {e}")
++        return
++    
++    try:
++        all_replies_df, skipped_replies = process_replies(all_replies, all_comments_df)
++        replies_file = os.path.join(base_dir, "replies.csv")
++        save(all_replies_df, replies_file)
++        logger.info(f"Saved {len(all_replies_df)} replies to {replies_file}")
++        
++        if skipped_replies:
++            skipped_replies_file = os.path.join(base_dir, "skipped_replies.json")
++            save_skipped(skipped_replies, skipped_replies_file)
++            logger.warning(f"Skipped {len(skipped_replies)} replies, saved to {skipped_replies_file}")
++    except Exception as e:
++        logger.error(f"Error processing replies: {e}")
++        return
+ 
+ 
+-# 运行 main 函数
+ if __name__ == "__main__":
+-    asyncio.run(main())
+-    print('done!')
++    try:
++        asyncio.run(main())
++        logger.info('done!')
++    except Exception as e:
++        logger.error(f"Fatal error: {e}", exc_info=True)

@@ -2,7 +2,6 @@ import hashlib
 import random
 import re
 import urllib.parse
-from abc import ABC, abstractmethod
 
 import cookiesparser
 import execjs
@@ -12,6 +11,7 @@ HOST = 'https://www.douyin.com'
 WEBID_URL = 'https://www.douyin.com/?recommend=1'
 REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
 WEBID_PATTERN = re.compile(r'(?:\\"user_unique_id\\":\\"(\d+)\\"|"user_unique_id"\s*:\s*"(\d+)")')
+_SIGNER = None
 
 COMMON_PARAMS = {
     'device_platform': 'webapp',
@@ -69,92 +69,11 @@ class WebIdRedirectError(RuntimeError):
         super().__init__(message)
 
 
-class Signer(ABC):
-    @abstractmethod
-    def sign(self, query: str, user_agent: str) -> str:
-        raise NotImplementedError
-
-    def sign_detail(self, query: str, user_agent: str) -> str:
-        return self.sign(query, user_agent)
-
-    def sign_reply(self, query: str, user_agent: str) -> str:
-        return self.sign(query, user_agent)
-
-
-class LocalJSSigner(Signer):
-    def __init__(self, js_path: str = 'douyin.js'):
-        self._js_path = js_path
-        self._compiled = None
-
-    def _get_compiled(self):
-        if self._compiled is None:
-            with open(self._js_path, encoding='utf-8') as f:
-                self._compiled = execjs.compile(f.read())
-        return self._compiled
-
-    def sign(self, query: str, user_agent: str) -> str:
-        return self._get_compiled().call('sign_datail', query, user_agent)
-
-    def sign_reply(self, query: str, user_agent: str) -> str:
-        return self._get_compiled().call('sign_reply', query, user_agent)
-
-
-class MockSigner(Signer):
-    def __init__(self, a_bogus: str = "mock_a_bogus_value"):
-        self._a_bogus = a_bogus
-
-    def sign(self, query: str, user_agent: str) -> str:
-        return self._a_bogus
-
-    def sign_reply(self, query: str, user_agent: str) -> str:
-        return self._a_bogus
-
-
-class RemoteSigner(Signer):
-    def __init__(self, endpoint: str, api_key: str | None = None):
-        self._endpoint = endpoint
-        self._api_key = api_key
-
-    def sign(self, query: str, user_agent: str) -> str:
-        headers = {}
-        if self._api_key:
-            headers['Authorization'] = f'Bearer {self._api_key}'
-        response = requests.post(
-            self._endpoint,
-            json={'query': query, 'userAgent': user_agent},
-            headers=headers,
-            timeout=30
-        )
-        response.raise_for_status()
-        return response.json()['a_bogus']
-
-    def sign_reply(self, query: str, user_agent: str) -> str:
-        headers = {}
-        if self._api_key:
-            headers['Authorization'] = f'Bearer {self._api_key}'
-        response = requests.post(
-            self._endpoint,
-            json={'query': query, 'userAgent': user_agent, 'type': 'reply'},
-            headers=headers,
-            timeout=30
-        )
-        response.raise_for_status()
-        return response.json()['a_bogus']
-
-
-_signer: Signer | None = None
-
-
-def get_signer() -> Signer:
-    global _signer
-    if _signer is None:
-        _signer = LocalJSSigner()
-    return _signer
-
-
-def set_signer(signer: Signer) -> None:
-    global _signer
-    _signer = signer
+def get_signer():
+    global _SIGNER
+    if _SIGNER is None:
+        _SIGNER = execjs.compile(open('douyin.js', encoding='utf-8').read())
+    return _SIGNER
 
 
 def extract_webid(response_text: str) -> str | None:
@@ -249,10 +168,9 @@ def common(uri, params: dict, headers: dict) -> tuple[dict, dict]:
     headers.update(COMMON_HEADERS)
     params = deal_params(params, headers)
     query = '&'.join([f'{k}={urllib.parse.quote(str(v))}' for k, v in params.items()])
-    signer = get_signer()
+    call_name = 'sign_datail'
     if 'reply' in uri:
-        a_bogus = signer.sign_reply(query, headers["User-Agent"])
-    else:
-        a_bogus = signer.sign_detail(query, headers["User-Agent"])
+        call_name = 'sign_reply'
+    a_bogus = get_signer().call(call_name, query, headers["User-Agent"])
     params['a_bogus'] = a_bogus
     return params, headers
