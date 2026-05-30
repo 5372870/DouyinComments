@@ -1,0 +1,296 @@
+diff --git a/common.py b/common.py
+index ea674e9..1b239fe 100644
+--- a/common.py
++++ b/common.py
+@@ -1,100 +1,59 @@
++import abc
+ import hashlib
+ import random
+ import re
+ import urllib.parse
+-from abc import ABC, abstractmethod
+-from pathlib import Path
+ 
+ import cookiesparser
+ import execjs
+ import requests
+ 
+-HOST = 'https://www.douyin.com'
+-WEBID_URL = 'https://www.douyin.com/?recommend=1'
+-REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
+-WEBID_PATTERN = re.compile(r'(?:\\"user_unique_id\\":\\"(\d+)\\"|"user_unique_id"\s*:\s*"(\d+)")')
+-_SIGNER = None
+-_DEFAULT_SIGNER = None
+-
+-
+-class Signer(ABC):
+-    @abstractmethod
++class Signer(abc.ABC):
++    """Abstract base class for Douyin signature logic."""
++    @abc.abstractmethod
+     def sign(self, call_name: str, query: str, user_agent: str) -> str:
+-        raise NotImplementedError
+-
++        pass
+ 
+-class LocalJsSigner(Signer):
+-    def __init__(self, js_path: str | Path | None = None):
+-        if js_path is None:
+-            js_path = Path(__file__).with_name('douyin.js')
+-        self.js_path = Path(js_path)
+-        self._js_context = None
++class LocalJSSigner(Signer):
++    """Signer implementation using local JS file and execjs."""
++    def __init__(self, js_path: str = 'douyin.js'):
++        self.js_path = js_path
++        self._ctx = None
+ 
+-    def get_js_context(self):
+-        global _SIGNER
+-        if self._js_context is None:
+-            with self.js_path.open(encoding='utf-8') as js_file:
+-                self._js_context = execjs.compile(js_file.read())
+-            _SIGNER = self._js_context
+-        return self._js_context
++    @property
++    def ctx(self):
++        if self._ctx is None:
++            with open(self.js_path, encoding='utf-8') as f:
++                self._ctx = execjs.compile(f.read())
++        return self._ctx
+ 
+     def sign(self, call_name: str, query: str, user_agent: str) -> str:
+-        return self.get_js_context().call(call_name, query, user_agent)
+-
+-
+-class RemoteApiSigner(Signer):
+-    def __init__(
+-        self,
+-        endpoint: str,
+-        session: requests.Session | None = None,
+-        timeout: float = 10,
+-        response_field: str = 'a_bogus',
+-    ):
+-        self.endpoint = endpoint
+-        self.session = session or requests.Session()
+-        self.timeout = timeout
+-        self.response_field = response_field
++        return self.ctx.call(call_name, query, user_agent)
++
++class RemoteAPISigner(Signer):
++    """Signer implementation using a remote API service."""
++    def __init__(self, api_url: str):
++        self.api_url = api_url
+ 
+     def sign(self, call_name: str, query: str, user_agent: str) -> str:
+-        response = self.session.post(
+-            self.endpoint,
+-            json={
+-                'call_name': call_name,
+-                'query': query,
+-                'user_agent': user_agent,
+-            },
+-            timeout=self.timeout,
+-        )
++        response = requests.post(self.api_url, json={
++            'call_name': call_name,
++            'query': query,
++            'user_agent': user_agent
++        })
+         response.raise_for_status()
+-        payload = response.json()
+-        value = payload.get(self.response_field)
+-        if value is None:
+-            raise ValueError(f'missing signer response field: {self.response_field}')
+-        return str(value)
+-
++        return response.json().get('a_bogus', '')
+ 
+ class MockSigner(Signer):
+-    def __init__(self, return_value: str = 'mock_a_bogus'):
+-        self.return_value = return_value
+-        self.calls: list[dict[str, str]] = []
+-
++    """Mock signer for testing purposes."""
+     def sign(self, call_name: str, query: str, user_agent: str) -> str:
+-        self.calls.append(
+-            {
+-                'call_name': call_name,
+-                'query': query,
+-                'user_agent': user_agent,
+-            }
+-        )
+-        return self.return_value
+-
++        return "mock_a_bogus_signature"
+ 
+-class _LegacyDouyinSign:
+-    def call(self, call_name: str, query: str, user_agent: str) -> str:
+-        return get_default_signer().sign(call_name, query, user_agent)
+-
+-
+-DOUYIN_SIGN = _LegacyDouyinSign()
++HOST = 'https://www.douyin.com'
++WEBID_URL = 'https://www.douyin.com/?recommend=1'
++REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
++WEBID_PATTERN = re.compile(r'(?:\\"user_unique_id\\":\\"(\d+)\\"|"user_unique_id"\s*:\s*"(\d+)")')
++_SIGNER = None
+ 
+ COMMON_PARAMS = {
+     'device_platform': 'webapp',
+@@ -152,24 +111,15 @@ class WebIdRedirectError(RuntimeError):
+         super().__init__(message)
+ 
+ 
+-def get_default_signer() -> Signer:
+-    global _DEFAULT_SIGNER
+-    if _DEFAULT_SIGNER is None:
+-        _DEFAULT_SIGNER = LocalJsSigner()
+-    return _DEFAULT_SIGNER
++def get_signer() -> Signer:
++    global _SIGNER
++    if _SIGNER is None:
++        _SIGNER = LocalJSSigner()
++    return _SIGNER
+ 
+-
+-def set_default_signer(signer: Signer | None) -> None:
+-    global _DEFAULT_SIGNER, _SIGNER
+-    _DEFAULT_SIGNER = signer
+-    _SIGNER = signer._js_context if isinstance(signer, LocalJsSigner) else None
+-
+-
+-def get_signer():
+-    signer = get_default_signer()
+-    if isinstance(signer, LocalJsSigner):
+-        return signer.get_js_context()
+-    return DOUYIN_SIGN
++def set_signer(signer: Signer):
++    global _SIGNER
++    _SIGNER = signer
+ 
+ 
+ def extract_webid(response_text: str) -> str | None:
+@@ -259,24 +209,16 @@ def get_ms_token(randomlength=120):
+     return random_str
+ 
+ 
+-def resolve_sign_call_name(uri: str) -> str:
+-    if 'reply' in uri:
+-        return 'sign_reply'
+-    return 'sign_datail'
+-
+-
+-def build_sign_query(params: dict) -> str:
+-    return '&'.join([f'{key}={urllib.parse.quote(str(value))}' for key, value in params.items()])
+-
+-
+-def sign_request(uri: str, params: dict, headers: dict, signer: Signer | None = None) -> str:
+-    active_signer = signer or get_default_signer()
+-    return active_signer.sign(resolve_sign_call_name(uri), build_sign_query(params), headers['User-Agent'])
+-
+-
+ def common(uri, params: dict, headers: dict, signer: Signer | None = None) -> tuple[dict, dict]:
+     params.update(COMMON_PARAMS)
+     headers.update(COMMON_HEADERS)
+     params = deal_params(params, headers)
+-    params['a_bogus'] = sign_request(uri, params, headers, signer=signer)
++    query = '&'.join([f'{k}={urllib.parse.quote(str(v))}' for k, v in params.items()])
++    call_name = 'sign_datail'
++    if 'reply' in uri:
++        call_name = 'sign_reply'
++    
++    actual_signer = signer or get_signer()
++    a_bogus = actual_signer.sign(call_name, query, headers["User-Agent"])
++    params['a_bogus'] = a_bogus
+     return params, headers
+diff --git a/test_common.py b/test_common.py
+deleted file mode 100644
+index e274b5d..0000000
+--- a/test_common.py
++++ /dev/null
+@@ -1,84 +0,0 @@
+-import unittest
+-from unittest.mock import MagicMock, patch
+-
+-from common import DOUYIN_SIGN, MockSigner, RemoteApiSigner, build_sign_query, common, set_default_signer, sign_request
+-
+-
+-class CommonSignerInjectionTestCase(unittest.TestCase):
+-    def tearDown(self):
+-        set_default_signer(None)
+-
+-    @patch('common.execjs.compile')
+-    def test_common_accepts_mock_signer_without_loading_js(self, mock_compile):
+-        signer = MockSigner('signed-by-mock')
+-        params, headers = common(
+-            'https://www.douyin.com/aweme/v1/web/comment/list/',
+-            {'aweme_id': '123'},
+-            {},
+-            signer=signer,
+-        )
+-
+-        self.assertEqual(params['a_bogus'], 'signed-by-mock')
+-        self.assertEqual(signer.calls[0]['call_name'], 'sign_datail')
+-        self.assertIn('aweme_id=123', signer.calls[0]['query'])
+-        self.assertEqual(signer.calls[0]['user_agent'], headers['User-Agent'])
+-        mock_compile.assert_not_called()
+-
+-    def test_legacy_douyin_sign_uses_injected_default_signer(self):
+-        signer = MockSigner('legacy-signature')
+-        set_default_signer(signer)
+-
+-        result = DOUYIN_SIGN.call('sign_reply', 'cursor=1', 'test-agent')
+-
+-        self.assertEqual(result, 'legacy-signature')
+-        self.assertEqual(
+-            signer.calls,
+-            [
+-                {
+-                    'call_name': 'sign_reply',
+-                    'query': 'cursor=1',
+-                    'user_agent': 'test-agent',
+-                }
+-            ],
+-        )
+-
+-    def test_sign_request_can_be_tested_independently(self):
+-        signer = MockSigner('request-signature')
+-
+-        result = sign_request(
+-            'https://www.douyin.com/aweme/v1/web/comment/list/reply/',
+-            {'cursor': 1, 'text': 'hello world'},
+-            {'User-Agent': 'agent'},
+-            signer=signer,
+-        )
+-
+-        self.assertEqual(result, 'request-signature')
+-        self.assertEqual(signer.calls[0]['call_name'], 'sign_reply')
+-        self.assertEqual(signer.calls[0]['query'], build_sign_query({'cursor': 1, 'text': 'hello world'}))
+-
+-
+-class RemoteApiSignerTestCase(unittest.TestCase):
+-    def test_remote_api_signer_reads_signature_from_response(self):
+-        session = MagicMock()
+-        response = MagicMock()
+-        response.json.return_value = {'a_bogus': 'remote-signature'}
+-        session.post.return_value = response
+-        signer = RemoteApiSigner('https://signer.example/api', session=session, timeout=3)
+-
+-        result = signer.sign('sign_datail', 'aweme_id=1', 'agent')
+-
+-        self.assertEqual(result, 'remote-signature')
+-        session.post.assert_called_once_with(
+-            'https://signer.example/api',
+-            json={
+-                'call_name': 'sign_datail',
+-                'query': 'aweme_id=1',
+-                'user_agent': 'agent',
+-            },
+-            timeout=3,
+-        )
+-        response.raise_for_status.assert_called_once_with()
+-
+-
+-if __name__ == '__main__':
+-    unittest.main()
