@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 from datetime import datetime
 from typing import Any
@@ -8,6 +9,16 @@ import pandas as pd
 from tqdm import tqdm
 
 from common import common
+
+logging.basicConfig(
+    level=logging.WARNING,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler('missing_fields.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 url = "https://www.douyin.com/aweme/v1/web/comment/list/"
 
@@ -46,20 +57,59 @@ async def fetch_all_comments_async(aweme_id: str) -> list[dict[str, Any]]:
         return all_comments
 
 
+def safe_get(data: dict, keys: list[str], default=None):
+    result = data
+    for key in keys:
+        if isinstance(result, dict) and key in result:
+            result = result[key]
+        else:
+            return default
+    return result
+
+
+def _extract_image_url(c: dict):
+    image_list = c.get('image_list')
+    if not image_list or not isinstance(image_list, list):
+        return None
+    try:
+        return image_list[0]['origin_url']['url_list']
+    except (IndexError, KeyError, TypeError):
+        return None
+
+
 def process_comments(comments: list[dict[str, Any]]) -> pd.DataFrame:
-    data = [{
-        "评论ID": c['cid'],
-        "评论内容": c['text'],
-        "评论图片": c['image_list'][0]['origin_url']['url_list'] if c['image_list'] else None,
-        "点赞数": c['digg_count'],
-        "评论时间": datetime.fromtimestamp(c['create_time']).strftime('%Y-%m-%d %H:%M:%S'),
-        "用户昵称": c['user']['nickname'],
-        "用户主页链接": f"https://www.douyin.com/user/{c['user']['sec_uid']}",
-        "用户抖音号": c['user'].get('unique_id', '未知'),
-        "用户签名": c['user'].get('signature', '未知'),
-        "回复总数": c['reply_comment_total'],
-        "ip归属": c['ip_label']
-    } for c in comments]
+    data = []
+    skipped = 0
+    for c in comments:
+        try:
+            cid = c.get('cid')
+            if not cid:
+                logger.warning("评论缺少 cid 字段，已跳过: %s", {k: v for k, v in c.items() if k in ('cid', 'text')})
+                skipped += 1
+                continue
+            row = {
+                "评论ID": cid,
+                "评论内容": c.get('text', ''),
+                "评论图片": _extract_image_url(c),
+                "点赞数": c.get('digg_count', 0),
+                "评论时间": datetime.fromtimestamp(c['create_time']).strftime('%Y-%m-%d %H:%M:%S') if c.get('create_time') else '未知',
+                "用户昵称": safe_get(c, ['user', 'nickname'], '未知'),
+                "用户主页链接": f"https://www.douyin.com/user/{safe_get(c, ['user', 'sec_uid'], '')}" if safe_get(c, ['user', 'sec_uid']) else '',
+                "用户抖音号": safe_get(c, ['user', 'unique_id'], '未知'),
+                "用户签名": safe_get(c, ['user', 'signature'], '未知'),
+                "回复总数": c.get('reply_comment_total', 0),
+                "ip归属": c.get('ip_label', '未知')
+            }
+            missing = [k for k in ('cid', 'text', 'digg_count', 'create_time', 'user', 'reply_comment_total', 'ip_label') if k not in c]
+            if missing:
+                logger.warning("评论ID=%s 缺少字段: %s", cid, missing)
+            data.append(row)
+        except Exception as e:
+            cid = c.get('cid', '未知')
+            logger.warning("评论ID=%s 解析异常，已跳过: %s", cid, e)
+            skipped += 1
+    if skipped:
+        print(f"⚠ 评论处理完成，跳过 {skipped} 条不完整数据（详见 missing_fields.log）")
     return pd.DataFrame(data)
 
 
