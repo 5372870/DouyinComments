@@ -1,8 +1,9 @@
 import hashlib
+import os
 import random
 import re
-import time
 import urllib.parse
+from abc import ABC, abstractmethod
 
 import cookiesparser
 import execjs
@@ -13,6 +14,37 @@ WEBID_URL = 'https://www.douyin.com/?recommend=1'
 REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
 WEBID_PATTERN = re.compile(r'(?:\\"user_unique_id\\":\\"(\d+)\\"|"user_unique_id"\s*:\s*"(\d+)")')
 _SIGNER = None
+_DEFAULT_SIGNER = None
+
+
+class Signer(ABC):
+    @abstractmethod
+    def sign(self, call_name: str, query: str, user_agent: str) -> str:
+        pass
+
+
+class LocalJsSigner(Signer):
+    def __init__(self, js_path: str = 'douyin.js'):
+        self.js_path = js_path
+        self._js_context = None
+
+    @property
+    def js_context(self):
+        if self._js_context is None:
+            with open(self.js_path, encoding='utf-8') as f:
+                self._js_context = execjs.compile(f.read())
+        return self._js_context
+
+    def sign(self, call_name: str, query: str, user_agent: str) -> str:
+        return self.js_context.call(call_name, query, user_agent)
+
+
+class MockSigner(Signer):
+    def __init__(self, return_value: str = 'mock_a_bogus'):
+        self.return_value = return_value
+
+    def sign(self, call_name: str, query: str, user_agent: str) -> str:
+        return self.return_value
 
 COMMON_PARAMS = {
     'device_platform': 'webapp',
@@ -70,6 +102,18 @@ class WebIdRedirectError(RuntimeError):
         super().__init__(message)
 
 
+def get_default_signer():
+    global _DEFAULT_SIGNER
+    if _DEFAULT_SIGNER is None:
+        _DEFAULT_SIGNER = LocalJsSigner()
+    return _DEFAULT_SIGNER
+
+
+def set_default_signer(signer: Signer):
+    global _DEFAULT_SIGNER
+    _DEFAULT_SIGNER = signer
+
+
 def get_signer():
     global _SIGNER
     if _SIGNER is None:
@@ -111,12 +155,10 @@ def get_webid(headers: dict, cookie_dict: dict | None = None, max_retries: int =
     request_headers['sec-fetch-dest'] = 'document'
     attempts = max(1, max_retries + 1)
 
-    for attempt in range(attempts):
+    for _ in range(attempts):
         try:
             response = requests.get(WEBID_URL, headers=request_headers, allow_redirects=False, timeout=10)
         except requests.RequestException:
-            if attempt < attempts - 1:
-                time.sleep(1)
             continue
 
         if response.status_code in REDIRECT_STATUS_CODES:
@@ -126,9 +168,6 @@ def get_webid(headers: dict, cookie_dict: dict | None = None, max_retries: int =
             webid = extract_webid(response.text)
             if webid:
                 return webid
-
-        if attempt < attempts - 1:
-            time.sleep(1)
 
     return infer_webid_from_cookie(cookie_dict or {})
 
@@ -169,7 +208,7 @@ def get_ms_token(randomlength=120):
     return random_str
 
 
-def common(uri, params: dict, headers: dict) -> tuple[dict, dict]:
+def common(uri, params: dict, headers: dict, signer: Signer | None = None) -> tuple[dict, dict]:
     params.update(COMMON_PARAMS)
     headers.update(COMMON_HEADERS)
     params = deal_params(params, headers)
@@ -177,6 +216,10 @@ def common(uri, params: dict, headers: dict) -> tuple[dict, dict]:
     call_name = 'sign_datail'
     if 'reply' in uri:
         call_name = 'sign_reply'
-    a_bogus = get_signer().call(call_name, query, headers["User-Agent"])
+    
+    if signer is None:
+        signer = get_default_signer()
+    
+    a_bogus = signer.sign(call_name, query, headers["User-Agent"])
     params['a_bogus'] = a_bogus
     return params, headers

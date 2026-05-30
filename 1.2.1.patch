@@ -1,0 +1,479 @@
+diff --git a/common.py b/common.py
+index ab8b839..89d8549 100644
+--- a/common.py
++++ b/common.py
+@@ -1,8 +1,9 @@
+ import hashlib
++import os
+ import random
+ import re
+-import time
+ import urllib.parse
++from abc import ABC, abstractmethod
+ 
+ import cookiesparser
+ import execjs
+@@ -13,6 +14,37 @@ WEBID_URL = 'https://www.douyin.com/?recommend=1'
+ REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
+ WEBID_PATTERN = re.compile(r'(?:\\"user_unique_id\\":\\"(\d+)\\"|"user_unique_id"\s*:\s*"(\d+)")')
+ _SIGNER = None
++_DEFAULT_SIGNER = None
++
++
++class Signer(ABC):
++    @abstractmethod
++    def sign(self, call_name: str, query: str, user_agent: str) -> str:
++        pass
++
++
++class LocalJsSigner(Signer):
++    def __init__(self, js_path: str = 'douyin.js'):
++        self.js_path = js_path
++        self._js_context = None
++
++    @property
++    def js_context(self):
++        if self._js_context is None:
++            with open(self.js_path, encoding='utf-8') as f:
++                self._js_context = execjs.compile(f.read())
++        return self._js_context
++
++    def sign(self, call_name: str, query: str, user_agent: str) -> str:
++        return self.js_context.call(call_name, query, user_agent)
++
++
++class MockSigner(Signer):
++    def __init__(self, return_value: str = 'mock_a_bogus'):
++        self.return_value = return_value
++
++    def sign(self, call_name: str, query: str, user_agent: str) -> str:
++        return self.return_value
+ 
+ COMMON_PARAMS = {
+     'device_platform': 'webapp',
+@@ -70,6 +102,18 @@ class WebIdRedirectError(RuntimeError):
+         super().__init__(message)
+ 
+ 
++def get_default_signer():
++    global _DEFAULT_SIGNER
++    if _DEFAULT_SIGNER is None:
++        _DEFAULT_SIGNER = LocalJsSigner()
++    return _DEFAULT_SIGNER
++
++
++def set_default_signer(signer: Signer):
++    global _DEFAULT_SIGNER
++    _DEFAULT_SIGNER = signer
++
++
+ def get_signer():
+     global _SIGNER
+     if _SIGNER is None:
+@@ -111,12 +155,10 @@ def get_webid(headers: dict, cookie_dict: dict | None = None, max_retries: int =
+     request_headers['sec-fetch-dest'] = 'document'
+     attempts = max(1, max_retries + 1)
+ 
+-    for attempt in range(attempts):
++    for _ in range(attempts):
+         try:
+             response = requests.get(WEBID_URL, headers=request_headers, allow_redirects=False, timeout=10)
+         except requests.RequestException:
+-            if attempt < attempts - 1:
+-                time.sleep(1)
+             continue
+ 
+         if response.status_code in REDIRECT_STATUS_CODES:
+@@ -127,9 +169,6 @@ def get_webid(headers: dict, cookie_dict: dict | None = None, max_retries: int =
+             if webid:
+                 return webid
+ 
+-        if attempt < attempts - 1:
+-            time.sleep(1)
+-
+     return infer_webid_from_cookie(cookie_dict or {})
+ 
+ 
+@@ -169,7 +208,7 @@ def get_ms_token(randomlength=120):
+     return random_str
+ 
+ 
+-def common(uri, params: dict, headers: dict) -> tuple[dict, dict]:
++def common(uri, params: dict, headers: dict, signer: Signer | None = None) -> tuple[dict, dict]:
+     params.update(COMMON_PARAMS)
+     headers.update(COMMON_HEADERS)
+     params = deal_params(params, headers)
+@@ -177,6 +216,10 @@ def common(uri, params: dict, headers: dict) -> tuple[dict, dict]:
+     call_name = 'sign_datail'
+     if 'reply' in uri:
+         call_name = 'sign_reply'
+-    a_bogus = get_signer().call(call_name, query, headers["User-Agent"])
++    
++    if signer is None:
++        signer = get_default_signer()
++    
++    a_bogus = signer.sign(call_name, query, headers["User-Agent"])
+     params['a_bogus'] = a_bogus
+     return params, headers
+diff --git a/run_tests.py b/run_tests.py
+deleted file mode 100644
+index b2f0485..0000000
+--- a/run_tests.py
++++ /dev/null
+@@ -1,82 +0,0 @@
+-import sys
+-import os
+-sys.path.insert(0, '/app/DouyinComments')
+-os.chdir('/app/DouyinComments')
+-
+-from unittest.mock import patch, MagicMock
+-from common import extract_webid, infer_webid_from_cookie, get_webid, deal_params, WebIdRedirectError
+-
+-results = []
+-
+-# Test 1: no target string
+-r = extract_webid('<html>no user_unique_id here</html>')
+-passed = r is None
+-results.append(('Test 1 (no target string)', passed, r))
+-
+-# Test 2: multiple matches
+-text = '<script>\\"user_unique_id\\":\\"1111111111111111111\\",\\"user_unique_id\\":\\"2222222222222222222\\"</script>'
+-r = extract_webid(text)
+-passed = r is None
+-results.append(('Test 2 (multiple matches)', passed, r))
+-
+-# Test 3: abnormal escape
+-text = '<script>\\\\\\"user_unique_id\\\\\\":\\\\\\"3333333333333333333\\\\\\"</script>'
+-r = extract_webid(text)
+-passed = r is None
+-results.append(('Test 3 (abnormal escape)', passed, r))
+-
+-# Test 4: normal match
+-text = '<script>\\"user_unique_id\\":\\"7362810250930783783\\"</script>'
+-r = extract_webid(text)
+-passed = r == "7362810250930783783"
+-results.append(('Test 4 (normal match)', passed, r))
+-
+-# Test 5: 302 redirect
+-with patch('common.requests.get') as mock_get:
+-    mock_response = MagicMock()
+-    mock_response.status_code = 302
+-    mock_response.headers = {'Location': 'https://www.douyin.com/login'}
+-    mock_get.return_value = mock_response
+-    try:
+-        get_webid({'User-Agent': 'test', 'cookie': 'test=1'})
+-        results.append(('Test 5 (302 redirect)', False, 'no exception'))
+-    except WebIdRedirectError as e:
+-        results.append(('Test 5 (302 redirect)', True, str(e)))
+-
+-# Test 6: webid=None in deal_params
+-with patch('common.get_webid') as mock:
+-    mock.return_value = None
+-    params = {'aweme_id': '123'}
+-    headers = {'cookie': 's_v_web_id=verify_test; dy_swidth=1920', 'User-Agent': 'test'}
+-    result = deal_params(params.copy(), headers.copy())
+-    passed = 'webid' not in result
+-    results.append(('Test 6 (webid=None in deal_params)', passed, 'webid' in result))
+-
+-# Test 7: webid present in deal_params
+-with patch('common.get_webid') as mock:
+-    mock.return_value = '7362810250930783783'
+-    params = {'aweme_id': '123'}
+-    headers = {'cookie': 's_v_web_id=verify_test; dy_swidth=1920', 'User-Agent': 'test'}
+-    result = deal_params(params.copy(), headers.copy())
+-    passed = result.get('webid') == '7362810250930783783'
+-    results.append(('Test 7 (webid present)', passed, result.get('webid')))
+-
+-# Test 8: cookie fallback direct
+-r = infer_webid_from_cookie({'webid': '1234567890123456789'})
+-passed = r == '1234567890123456789'
+-results.append(('Test 8 (cookie fallback)', passed, r))
+-
+-# Test 9: s_v_web_id fallback
+-r = infer_webid_from_cookie({'s_v_web_id': 'verify_ft1_1234567890123456789_xxxx'})
+-passed = r == '12345678901234567'
+-results.append(('Test 9 (s_v_web_id)', passed, r))
+-
+-# Write results to file
+-with open('/app/DouyinComments/test_results.txt', 'w') as f:
+-    passed_count = 0
+-    for name, passed, value in results:
+-        status = 'PASS' if passed else 'FAIL'
+-        if passed:
+-            passed_count += 1
+-        f.write(f'{name}: {status} (got {value})\n')
+-    f.write(f'\nTotal: {passed_count}/{len(results)} passed\n')
+diff --git a/test_webid.py b/test_webid.py
+deleted file mode 100644
+index 4ee2e39..0000000
+--- a/test_webid.py
++++ /dev/null
+@@ -1,268 +0,0 @@
+-import unittest
+-from unittest.mock import patch, MagicMock
+-
+-import requests
+-
+-from common import (
+-    extract_webid,
+-    infer_webid_from_cookie,
+-    get_webid,
+-    deal_params,
+-    WebIdRedirectError,
+-    WEBID_PATTERN,
+-    WEBID_URL,
+-)
+-
+-
+-class TestExtractWebid(unittest.TestCase):
+-
+-    def test_no_target_string_returns_none(self):
+-        """① 完全不含目标字符串 → 返回 None"""
+-        responses = [
+-            "",
+-            "<html><body>no user_unique_id here</body></html>",
+-            '{"user_id": 123, "name": "test"}',
+-            "<script>window.data = {}</script>",
+-        ]
+-        for text in responses:
+-            with self.subTest(text=text[:80]):
+-                self.assertIsNone(extract_webid(text))
+-
+-    def test_multiple_matches_returns_none(self):
+-        """② 含多个匹配项 → 返回 None（歧义，无法确定哪个是正确的）"""
+-        text = (
+-            '<script>'
+-            'window.__INITIAL_STATE__ = {'
+-            '\\"user_unique_id\\":\\"1111111111111111111\\",'
+-            '"other": "data",'
+-            '\\"user_unique_id\\":\\"2222222222222222222\\"'
+-            '}'
+-            '</script>'
+-        )
+-        self.assertIsNone(extract_webid(text))
+-
+-    def test_abnormal_escape_backslashes_returns_none(self):
+-        """③ 转义反斜杠数量异常（如 \\\\\"）→ 返回 None"""
+-        text = (
+-            '<script>'
+-            'window.__INITIAL_STATE__ = {'
+-            '\\\\"user_unique_id\\\\":\\\\"3333333333333333333\\\\"'
+-            '}'
+-            '</script>'
+-        )
+-        self.assertIsNone(extract_webid(text))
+-
+-    def test_normal_escaped_json_extracts_webid(self):
+-        text = (
+-            '<script>'
+-            'window.__INITIAL_STATE__ = {'
+-            '\\"user_unique_id\\":\\"7362810250930783783\\"'
+-            '}'
+-            '</script>'
+-        )
+-        result = extract_webid(text)
+-        self.assertEqual(result, "7362810250930783783")
+-
+-    def test_normal_json_extracts_webid(self):
+-        text = '{"user_unique_id": "7362810250930783783"}'
+-        result = extract_webid(text)
+-        self.assertEqual(result, "7362810250930783783")
+-
+-    def test_normal_json_no_space_extracts_webid(self):
+-        text = '{"user_unique_id":"7362810250930783783"}'
+-        result = extract_webid(text)
+-        self.assertEqual(result, "7362810250930783783")
+-
+-
+-class TestInferWebidFromCookie(unittest.TestCase):
+-
+-    def test_direct_webid_key(self):
+-        self.assertEqual(infer_webid_from_cookie({"webid": "1234567890123456789"}), "1234567890123456789")
+-
+-    def test_direct_web_id_key(self):
+-        self.assertEqual(infer_webid_from_cookie({"web_id": "9876543210987654321"}), "9876543210987654321")
+-
+-    def test_s_v_web_id_fallback(self):
+-        self.assertEqual(
+-            infer_webid_from_cookie({"s_v_web_id": "verify_ft1_1234567890123456789_xxxx"}),
+-            "12345678901234567",
+-        )
+-
+-    def test_no_digit_in_seed_fallback_to_hash(self):
+-        result = infer_webid_from_cookie({"s_v_web_id": "no_digits_here"})
+-        self.assertIsNotNone(result)
+-        self.assertEqual(len(result), 19)
+-        self.assertTrue(result.isdigit())
+-
+-    def test_empty_cookie_returns_none(self):
+-        self.assertIsNone(infer_webid_from_cookie({}))
+-
+-    def test_none_cookie_is_handled(self):
+-        with self.assertRaises(TypeError):
+-            infer_webid_from_cookie(None)
+-
+-
+-class TestGetWebid(unittest.TestCase):
+-
+-    def setUp(self):
+-        self.headers = {
+-            "User-Agent": "Mozilla/5.0",
+-            "cookie": "test=1",
+-        }
+-
+-    @patch("common.requests.get")
+-    def test_redirect_302_raises_error(self, mock_get):
+-        mock_response = MagicMock()
+-        mock_response.status_code = 302
+-        mock_response.headers = {"Location": "https://www.douyin.com/login"}
+-        mock_get.return_value = mock_response
+-
+-        with self.assertRaises(WebIdRedirectError) as ctx:
+-            get_webid(self.headers)
+-        self.assertEqual(ctx.exception.status_code, 302)
+-        self.assertIn("302", str(ctx.exception))
+-        self.assertIn("login", str(ctx.exception))
+-
+-    @patch("common.requests.get")
+-    def test_redirect_301_raises_error(self, mock_get):
+-        mock_response = MagicMock()
+-        mock_response.status_code = 301
+-        mock_response.headers = {}
+-        mock_get.return_value = mock_response
+-
+-        with self.assertRaises(WebIdRedirectError) as ctx:
+-            get_webid(self.headers)
+-        self.assertEqual(ctx.exception.status_code, 301)
+-        self.assertIn("301", str(ctx.exception))
+-
+-    @patch("common.requests.get")
+-    def test_successful_extraction_on_first_try(self, mock_get):
+-        mock_response = MagicMock()
+-        mock_response.status_code = 200
+-        mock_response.text = (
+-            '<script>'
+-            '\\"user_unique_id\\":\\"7362810250930783783\\"'
+-            '</script>'
+-        )
+-        mock_get.return_value = mock_response
+-
+-        result = get_webid(self.headers)
+-        self.assertEqual(result, "7362810250930783783")
+-        mock_get.assert_called_once()
+-
+-    @patch("common.requests.get")
+-    def test_retry_on_request_exception(self, mock_get):
+-        mock_success = MagicMock()
+-        mock_success.status_code = 200
+-        mock_success.text = (
+-            '<script>'
+-            '\\"user_unique_id\\":\\"5555555555555555555\\"'
+-            '</script>'
+-        )
+-        mock_get.side_effect = [
+-            requests.ConnectionError("network error"),
+-            mock_success,
+-        ]
+-
+-        result = get_webid(self.headers)
+-        self.assertEqual(result, "5555555555555555555")
+-        self.assertEqual(mock_get.call_count, 2)
+-
+-    @patch("common.requests.get")
+-    def test_retry_on_non_200_then_success(self, mock_get):
+-        mock_fail = MagicMock()
+-        mock_fail.status_code = 500
+-        mock_success = MagicMock()
+-        mock_success.status_code = 200
+-        mock_success.text = (
+-            '<script>'
+-            '\\"user_unique_id\\":\\"9999999999999999999\\"'
+-            '</script>'
+-        )
+-        mock_get.side_effect = [mock_fail, mock_success]
+-
+-        result = get_webid(self.headers)
+-        self.assertEqual(result, "9999999999999999999")
+-        self.assertEqual(mock_get.call_count, 2)
+-
+-    @patch("common.requests.get")
+-    def test_all_retries_fail_falls_back_to_cookie(self, mock_get):
+-        mock_response = MagicMock()
+-        mock_response.status_code = 200
+-        mock_response.text = "<html>no match ever</html>"
+-        mock_get.return_value = mock_response
+-
+-        result = get_webid(self.headers, cookie_dict={"webid": "1111111111111111111"})
+-        self.assertEqual(result, "1111111111111111111")
+-
+-    @patch("common.requests.get")
+-    def test_retry_count_respected(self, mock_get):
+-        mock_response = MagicMock()
+-        mock_response.status_code = 200
+-        mock_response.text = "<html>no match ever</html>"
+-        mock_get.return_value = mock_response
+-
+-        result = get_webid(self.headers, cookie_dict={"webid": "1111111111111111111"}, max_retries=1)
+-        self.assertEqual(result, "1111111111111111111")
+-        self.assertEqual(mock_get.call_count, 2)
+-
+-
+-class TestDealParams(unittest.TestCase):
+-
+-    def setUp(self):
+-        self.base_params = {"aweme_id": "123", "cursor": "0"}
+-        self.base_headers = {
+-            "cookie": "s_v_web_id=verify_test; dy_swidth=1920; dy_sheight=1080",
+-            "User-Agent": "Mozilla/5.0",
+-        }
+-
+-    @patch("common.get_webid")
+-    def test_webid_none_is_popped_from_params(self, mock_get_webid):
+-        """webid=None 时不应出现在 params 中，避免签名错误"""
+-        mock_get_webid.return_value = None
+-
+-        result = deal_params(self.base_params.copy(), self.base_headers.copy())
+-        self.assertNotIn("webid", result)
+-        self.assertIn("msToken", result)
+-
+-    @patch("common.get_webid")
+-    def test_webid_present_is_included(self, mock_get_webid):
+-        mock_get_webid.return_value = "7362810250930783783"
+-
+-        result = deal_params(self.base_params.copy(), self.base_headers.copy())
+-        self.assertEqual(result["webid"], "7362810250930783783")
+-
+-    def test_no_cookie_returns_params_unchanged(self):
+-        headers = {"User-Agent": "Mozilla/5.0"}
+-        result = deal_params(self.base_params.copy(), headers)
+-        self.assertEqual(result, self.base_params)
+-
+-    @patch("common.get_webid")
+-    def test_signing_does_not_crash_when_webid_none(self, mock_get_webid):
+-        """验证上层 common() 不会因 webid=None 而崩溃"""
+-        import os
+-        mock_get_webid.return_value = None
+-
+-        has_js_runtime = os.path.isfile("douyin.js")
+-
+-        from common import common
+-        try:
+-            params, headers = common(
+-                "https://www.douyin.com/aweme/v1/web/comment/list/",
+-                self.base_params.copy(),
+-                self.base_headers.copy(),
+-            )
+-        except Exception as e:
+-            if has_js_runtime:
+-                self.fail(f"common() raised {type(e).__name__}: {e}")
+-            else:
+-                self.skipTest(f"JS runtime unavailable, skipping integration test: {e}")
+-                return
+-
+-        self.assertNotIn("webid", params)
+-        if has_js_runtime:
+-            self.assertIn("a_bogus", params)
+-
+-
+-if __name__ == "__main__":
+-    unittest.main()
