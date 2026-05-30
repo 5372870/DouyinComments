@@ -10,7 +10,7 @@ import requests
 HOST = 'https://www.douyin.com'
 WEBID_URL = 'https://www.douyin.com/?recommend=1'
 REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
-WEBID_PATTERN = re.compile(r'(?:\\"user_unique_id\\":\\"(\d+)\\"|"user_unique_id"\s*:\s*"(\d+)")')
+WEBID_PATTERN = re.compile(r'(?:(?<!\\)\\"user_unique_id\\":\\"(\d+)\\"|(?<!\\)"user_unique_id"\s*:\s*"(\d+)")')
 _SIGNER = None
 
 COMMON_PARAMS = {
@@ -147,10 +147,10 @@ def deal_params(params: dict, headers: dict) -> dict:
         params.pop('fp', None)
 
     webid = get_webid(headers, cookie_dict=cookie_dict)
-    if webid:
-        params['webid'] = webid
-    else:
-        params.pop('webid', None)
+    if not webid:
+        # 终极兜底：生成一个随机的 19 位数字作为 webid，避免 webid=None 导致签名错误或缺少风控指纹
+        webid = str(random.randint(7000000000000000000, 7999999999999999999))
+    params['webid'] = webid
     return params
 
 
