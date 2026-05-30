@@ -1,6 +1,5 @@
 import asyncio
 import os
-import json
 from datetime import datetime
 from typing import Any
 
@@ -47,60 +46,37 @@ async def fetch_all_comments_async(aweme_id: str) -> list[dict[str, Any]]:
         return all_comments
 
 
-def process_comments(comments: list[dict[str, Any]]) -> tuple[pd.DataFrame, list]:
-    data = []
-    skipped = []
-    for c in comments:
-        try:
-            user = c.get('user') or {}
-            
-            image_url = None
-            if c.get('image_list'):
-                try:
-                    image_url = c['image_list'][0]['origin_url']['url_list'][0]
-                except (KeyError, IndexError, TypeError):
-                    pass
-            
-            item = {
-                "评论ID": c['cid'],
-                "评论内容": c.get('text', ''),
-                "评论图片": image_url,
-                "点赞数": c.get('digg_count', 0),
-                "评论时间": datetime.fromtimestamp(c.get('create_time', 0)).strftime('%Y-%m-%d %H:%M:%S'),
-                "用户昵称": user['nickname'],
-                "用户主页链接": f"https://www.douyin.com/user/{user['sec_uid']}" if user.get('sec_uid') else '',
-                "用户抖音号": user.get('unique_id', '未知'),
-                "用户签名": user.get('signature', '未知'),
-                "回复总数": c.get('reply_comment_total', 0),
-                "ip归属": c.get('ip_label', '未知')
-            }
-            data.append(item)
-        except KeyError as e:
-            skipped.append({"error": f"Missing key: {e}", "raw_data": c})
-        except Exception as e:
-            skipped.append({"error": str(e), "raw_data": c})
-            
-    return pd.DataFrame(data), skipped
+def process_comments(comments: list[dict[str, Any]]) -> pd.DataFrame:
+    data = [{
+        "评论ID": c['cid'],
+        "评论内容": c['text'],
+        "评论图片": c['image_list'][0]['origin_url']['url_list'] if c['image_list'] else None,
+        "点赞数": c['digg_count'],
+        "评论时间": datetime.fromtimestamp(c['create_time']).strftime('%Y-%m-%d %H:%M:%S'),
+        "用户昵称": c['user']['nickname'],
+        "用户主页链接": f"https://www.douyin.com/user/{c['user']['sec_uid']}",
+        "用户抖音号": c['user'].get('unique_id', '未知'),
+        "用户签名": c['user'].get('signature', '未知'),
+        "回复总数": c['reply_comment_total'],
+        "ip归属": c['ip_label']
+    } for c in comments]
+    return pd.DataFrame(data)
+
 
 def save(data: pd.DataFrame, filename: str):
     data.to_csv(filename, index=False)
+
 
 async def main():
     aweme_id = input("Enter the aweme_id: ")
     all_comments = await fetch_all_comments_async(aweme_id)
     print(f"Found {len(all_comments)} comments.")
-    comments_df, skipped = process_comments(all_comments)
+    comments_df = process_comments(all_comments)
     base_dir = f"data/{aweme_id}"
     os.makedirs(base_dir, exist_ok=True)
     comments_file = os.path.join(base_dir, "comments.csv")
     save(comments_df, comments_file)
     print("Comments saved to comments.csv")
-    
-    if skipped:
-        skipped_file = os.path.join(base_dir, "skipped_comments.json")
-        with open(skipped_file, "w", encoding="utf-8") as f:
-            json.dump(skipped, f, ensure_ascii=False, indent=2)
-        print(f"Skipped {len(skipped)} comments due to missing fields, saved to {skipped_file}")
 
 
 if __name__ == "__main__":

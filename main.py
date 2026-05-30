@@ -1,12 +1,25 @@
 import asyncio
 import json
+import logging
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 import os
 import httpx
 import pandas as pd
 from tqdm import tqdm
 from common import common
+
+BASE_DIR = f"data/v1"
+os.makedirs(BASE_DIR, exist_ok=True)
+logging.basicConfig(
+    level=logging.WARNING,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler(os.path.join(BASE_DIR, 'skipped_data.log'), encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 url = "https://www.douyin.com/aweme/v1/web/comment/list/"
 reply_url = url + "reply/"
@@ -68,12 +81,26 @@ async def get_replies_async(client: httpx.AsyncClient, semaphore, comment_id: st
             return {}
 
 
+def _safe_get_comment_image(comment: dict) -> Optional[str]:
+    try:
+        image_list = comment.get('image_list')
+        if image_list and isinstance(image_list, list) and len(image_list) > 0:
+            return image_list[0].get('origin_url', {}).get('url_list')
+    except (KeyError, IndexError, TypeError, AttributeError):
+        pass
+    return None
+
+
 async def fetch_replies_for_comment(client: httpx.AsyncClient, semaphore, comment: dict, pbar: tqdm) -> list:
-    comment_id = comment["cid"]
+    comment_id = comment.get("cid", "")
+    if not comment_id:
+        logger.warning("跳过无cid的评论: %s", json.dumps(comment, ensure_ascii=False)[:200])
+        pbar.update(1)
+        return []
     has_more = 1
     cursor = 0
     all_replies = []
-    while has_more and comment["reply_comment_total"] > 0:
+    while has_more and comment.get("reply_comment_total", 0) > 0:
         response = await get_replies_async(client, semaphore, comment_id, cursor=str(cursor))
         replies = response.get("comments", [])
         if isinstance(replies, list):
@@ -98,91 +125,103 @@ async def fetch_all_replies_async(comments: list) -> list:
     return all_replies
 
 
-def process_comments(comments: list[dict[str, Any]]) -> tuple[pd.DataFrame, list]:
+def _safe_extract_comment(comment: dict, index: int) -> Optional[dict]:
+    try:
+        user = comment.get('user') or {}
+        create_time = comment.get('create_time')
+        sec_uid = user.get('sec_uid', '')
+
+        return {
+            "评论ID": comment.get('cid', ''),
+            "评论内容": comment.get('text', ''),
+            "评论图片": _safe_get_comment_image(comment),
+            "点赞数": comment.get('digg_count', 0),
+            "评论时间": datetime.fromtimestamp(create_time).strftime('%Y-%m-%d %H:%M:%S') if create_time else '',
+            "用户昵称": user.get('nickname', '未知') or '未知',
+            "用户主页链接": f"https://www.douyin.com/user/{sec_uid}" if sec_uid else '',
+            "用户抖音号": user.get('unique_id') or user.get('short_id') or '未知',
+            "用户签名": user.get('signature', '未知') or '未知',
+            "回复总数": comment.get('reply_comment_total', 0),
+            "ip归属": comment.get('ip_label', '未知') or '未知',
+        }
+    except Exception as e:
+        cid = comment.get('cid', 'N/A')
+        logger.warning("跳过评论 #%d (cid=%s): %s | raw=%s",
+                       index, cid, e, json.dumps(comment, ensure_ascii=False)[:300])
+        return None
+
+
+def process_comments(comments: list[dict[str, Any]]) -> pd.DataFrame:
     data = []
-    skipped = []
-    for c in comments:
+    skipped_count = 0
+    for i, c in enumerate(comments):
+        record = _safe_extract_comment(c, i)
+        if record is not None:
+            data.append(record)
+        else:
+            skipped_count += 1
+
+    if skipped_count:
+        logger.warning("process_comments: 共跳过 %d 条评论（共 %d 条），详情见 skipped_data.log",
+                       skipped_count, len(comments))
+    return pd.DataFrame(data)
+
+
+def _safe_extract_reply(reply: dict, index: int, comments: pd.DataFrame) -> Optional[dict]:
+    try:
+        user = reply.get('user') or {}
+        create_time = reply.get('create_time')
+        sec_uid = user.get('sec_uid', '')
+        reply_id = reply.get('reply_id', '')
+        reply_to_reply_id = reply.get('reply_to_reply_id', '0')
+
+        reply_to = ''
         try:
-            user = c.get('user') or {}
-            
-            image_url = None
-            if c.get('image_list'):
-                try:
-                    image_url = c['image_list'][0]['origin_url']['url_list'][0]
-                except (KeyError, IndexError, TypeError):
-                    pass
-            
-            item = {
-                "评论ID": c['cid'],
-                "评论内容": c.get('text', ''),
-                "评论图片": image_url,
-                "点赞数": c.get('digg_count', 0),
-                "评论时间": datetime.fromtimestamp(c.get('create_time', 0)).strftime('%Y-%m-%d %H:%M:%S'),
-                "用户昵称": user['nickname'],
-                "用户主页链接": f"https://www.douyin.com/user/{user['sec_uid']}" if user.get('sec_uid') else '',
-                "用户抖音号": user.get('unique_id', '未知'),
-                "用户签名": user.get('signature', '未知'),
-                "回复总数": c.get('reply_comment_total', 0),
-                "ip归属": c.get('ip_label', '未知')
-            }
-            data.append(item)
-        except KeyError as e:
-            skipped.append({"error": f"Missing key: {e}", "raw_data": c})
-        except Exception as e:
-            skipped.append({"error": str(e), "raw_data": c})
-            
-    return pd.DataFrame(data), skipped
-
-
-def process_replies(replies: list[dict[str, Any]], comments: pd.DataFrame) -> tuple[pd.DataFrame, list]:
-    data = []
-    skipped = []
-    
-    comment_nickname_map = {}
-    if not comments.empty and '评论ID' in comments.columns and '用户昵称' in comments.columns:
-        comment_nickname_map = dict(zip(comments['评论ID'], comments['用户昵称']))
-
-    for c in replies:
-        try:
-            user = c.get('user') or {}
-            
-            image_url = None
-            if c.get('image_list'):
-                try:
-                    image_url = c['image_list'][0]['origin_url']['url_list'][0]
-                except (KeyError, IndexError, TypeError):
-                    pass
-            
-            reply_id = c['reply_id']
-            reply_to_reply_id = c.get("reply_to_reply_id", "0")
-            
-            if reply_to_reply_id == "0":
-                reply_to_who = comment_nickname_map.get(reply_id, "未知")
+            if reply_to_reply_id == '0':
+                matched = comments.loc[comments['评论ID'] == reply_id, '用户昵称']
+                if not matched.empty:
+                    reply_to = matched.values[0]
             else:
-                reply_to_who = c.get("reply_to_username", "未知")
+                reply_to = reply.get('reply_to_username', '') or ''
+        except (KeyError, IndexError, TypeError) as e:
+            logger.warning("回复 #%d 获取回复对象失败: %s", index, e)
 
-            item = {
-                "评论ID": c["cid"],
-                "评论内容": c.get("text", ""),
-                "评论图片": image_url,
-                "点赞数": c.get("digg_count", 0),
-                "评论时间": datetime.fromtimestamp(c.get("create_time", 0)).strftime("%Y-%m-%d %H:%M:%S"),
-                "用户昵称": user["nickname"],
-                "用户主页链接": f"https://www.douyin.com/user/{user['sec_uid']}" if user.get("sec_uid") else "",
-                "用户抖音号": user.get("unique_id", "未知"),
-                "用户签名": user.get("signature", "未知"),
-                "回复的评论": reply_id,
-                "具体的回复对象": reply_to_reply_id if reply_to_reply_id != "0" else reply_id,
-                "回复给谁": reply_to_who,
-                "ip归属": c.get("ip_label", "未知")
-            }
-            data.append(item)
-        except KeyError as e:
-            skipped.append({"error": f"Missing key: {e}", "raw_data": c})
-        except Exception as e:
-            skipped.append({"error": str(e), "raw_data": c})
+        return {
+            "评论ID": reply.get('cid', ''),
+            "评论内容": reply.get('text', ''),
+            "评论图片": _safe_get_comment_image(reply),
+            "点赞数": reply.get('digg_count', 0),
+            "评论时间": datetime.fromtimestamp(create_time).strftime('%Y-%m-%d %H:%M:%S') if create_time else '',
+            "用户昵称": user.get('nickname', '未知') or '未知',
+            "用户主页链接": f"https://www.douyin.com/user/{sec_uid}" if sec_uid else '',
+            "用户抖音号": user.get('unique_id') or user.get('short_id') or '未知',
+            "用户签名": user.get('signature', '未知') or '未知',
+            "回复的评论": reply_id,
+            "具体的回复对象": reply_to_reply_id if reply_to_reply_id != '0' else reply_id,
+            "回复给谁": reply_to,
+            "ip归属": reply.get('ip_label', '未知') or '未知',
+        }
+    except Exception as e:
+        cid = reply.get('cid', 'N/A')
+        logger.warning("跳过回复 #%d (cid=%s): %s | raw=%s",
+                       index, cid, e, json.dumps(reply, ensure_ascii=False)[:300])
+        return None
 
-    return pd.DataFrame(data), skipped
+
+def process_replies(replies: list[dict[str, Any]], comments: pd.DataFrame) -> pd.DataFrame:
+    data = []
+    skipped_count = 0
+    for i, c in enumerate(replies):
+        record = _safe_extract_reply(c, i, comments)
+        if record is not None:
+            data.append(record)
+        else:
+            skipped_count += 1
+
+    if skipped_count:
+        logger.warning("process_replies: 共跳过 %d 条回复（共 %d 条），详情见 skipped_data.log",
+                       skipped_count, len(replies))
+    return pd.DataFrame(data)
 
 
 def save(data: pd.DataFrame, filename: str):
@@ -196,27 +235,25 @@ async def main():
     # 评论部分
     all_comments = await fetch_all_comments_async(aweme_id)
     print(f"Found {len(all_comments)} comments.")
-    all_comments_, skipped_comments = process_comments(all_comments)
-    base_dir = f"data/v1/{aweme_id}"
+    all_comments_ = process_comments(all_comments)
+    base_dir = os.path.join(BASE_DIR, aweme_id)
     os.makedirs(base_dir, exist_ok=True)
     comments_file = os.path.join(base_dir, "comments.csv")
     save(all_comments_, comments_file)
-    if skipped_comments:
-        with open(os.path.join(base_dir, "skipped_comments.json"), "w", encoding="utf-8") as f:
-            json.dump(skipped_comments, f, ensure_ascii=False, indent=2)
-        print(f"Skipped {len(skipped_comments)} comments due to missing fields.")
+    print(f"评论已保存至 {comments_file}")
 
     # 回复部分 如果不需要直接注释掉
-    all_replies = await fetch_all_replies_async(all_comments)
-    print(f"Found {len(all_replies)} replies")
-    print(f"Found {len(all_replies) + len(all_comments)} in totals")
-    all_replies_df, skipped_replies = process_replies(all_replies, all_comments_)
-    replies_file = os.path.join(base_dir, "replies.csv")
-    save(all_replies_df, replies_file)
-    if skipped_replies:
-        with open(os.path.join(base_dir, "skipped_replies.json"), "w", encoding="utf-8") as f:
-            json.dump(skipped_replies, f, ensure_ascii=False, indent=2)
-        print(f"Skipped {len(skipped_replies)} replies due to missing fields.")
+    try:
+        all_replies = await fetch_all_replies_async(all_comments)
+        print(f"Found {len(all_replies)} replies")
+        print(f"Found {len(all_replies) + len(all_comments)} in totals")
+        all_replies = process_replies(all_replies, all_comments_)
+        replies_file = os.path.join(base_dir, "replies.csv")
+        save(all_replies, replies_file)
+        print(f"回复已保存至 {replies_file}")
+    except Exception as e:
+        logger.error("获取或处理回复时出错（评论数据已保存）: %s", e, exc_info=True)
+        print(f"回复处理失败，但评论已保存至 {comments_file}")
 
 
 # 运行 main 函数

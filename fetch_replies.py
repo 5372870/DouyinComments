@@ -1,16 +1,28 @@
 import asyncio
+import json
+import logging
 import httpx
 import pandas as pd
 from tqdm import tqdm
 import os
-import json
 from datetime import datetime
+from typing import Optional
 from common import common
 
 reply_url = "https://www.douyin.com/aweme/v1/web/comment/list/reply/"
 
 with open('cookie.txt', 'r') as f:
     cookie = f.readline().strip()
+
+logging.basicConfig(
+    level=logging.WARNING,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler('skipped_replies.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 
 async def get_replies_async(client: httpx.AsyncClient, semaphore, comment_id: str, cursor: str = "0",
@@ -44,13 +56,61 @@ async def fetch_replies_for_comment(client: httpx.AsyncClient, semaphore, commen
     return all_replies
 
 
+def _safe_get_comment_image(comment: dict) -> Optional[str]:
+    try:
+        image_list = comment.get('image_list')
+        if image_list and isinstance(image_list, list) and len(image_list) > 0:
+            return image_list[0].get('origin_url', {}).get('url_list')
+    except (KeyError, IndexError, TypeError, AttributeError):
+        pass
+    return None
+
+
+def _safe_extract_reply(reply: dict, index: int) -> Optional[dict]:
+    try:
+        user = reply.get('user') or {}
+        create_time = reply.get('create_time')
+        sec_uid = user.get('sec_uid', '')
+        reply_id = reply.get('reply_id', '')
+        reply_to_reply_id = reply.get('reply_to_reply_id', '0')
+
+        reply_to_username = ''
+        try:
+            if reply_to_reply_id == '0':
+                reply_to_username = ''
+            else:
+                reply_to_username = reply.get('reply_to_username', '') or ''
+        except (KeyError, IndexError, TypeError):
+            pass
+
+        return {
+            "评论ID": reply.get('cid', ''),
+            "评论内容": reply.get('text', ''),
+            "评论图片": _safe_get_comment_image(reply),
+            "点赞数": reply.get('digg_count', 0),
+            "评论时间": datetime.fromtimestamp(create_time).strftime('%Y-%m-%d %H:%M:%S') if create_time else '',
+            "用户昵称": user.get('nickname', '未知') or '未知',
+            "用户主页链接": f"https://www.douyin.com/user/{sec_uid}" if sec_uid else '',
+            "用户抖音号": user.get('unique_id') or user.get('short_id') or '未知',
+            "用户签名": user.get('signature', '未知') or '未知',
+            "回复的评论ID": reply_id,
+            "具体的回复对象": reply_to_reply_id if reply_to_reply_id != '0' else reply_id,
+            "回复给谁": reply_to_username,
+            "ip归属": reply.get('ip_label', '未知') or '未知',
+        }
+    except Exception as e:
+        cid = reply.get('cid', 'N/A')
+        logger.warning("跳过回复 #%d (cid=%s): %s | raw=%s",
+                       index, cid, e, json.dumps(reply, ensure_ascii=False)[:300])
+        return None
+
+
 def save_replies_and_progress(replies: list, output_file: str, progress_file: str, comment_id: str) -> bool:
     """
     保存爬取到的回复数据到文件，同时更新进度文件。
     只有当回复数据成功保存到文件时，才更新进度文件。
     """
     global buffer
-    global skipped_buffer
 
     if not replies:
         with open(progress_file, "a") as f:
@@ -58,45 +118,12 @@ def save_replies_and_progress(replies: list, output_file: str, progress_file: st
         return False
 
     # 收集数据到缓冲区
-    data = []
-    skipped = []
-    for c in replies:
-        try:
-            user = c.get('user') or {}
-            
-            image_url = None
-            if c.get('image_list'):
-                try:
-                    image_url = c['image_list'][0]['origin_url']['url_list'][0]
-                except (KeyError, IndexError, TypeError):
-                    pass
-            
-            reply_id = c['reply_id']
-            reply_to_reply_id = c.get("reply_to_reply_id", "0")
-            
-            item = {
-                "评论ID": c["cid"],
-                "评论内容": c.get("text", ""),
-                "评论图片": image_url,
-                "点赞数": c.get("digg_count", 0),
-                "评论时间": datetime.fromtimestamp(c.get("create_time", 0)).strftime("%Y-%m-%d %H:%M:%S"),
-                "用户昵称": user["nickname"],
-                "用户主页链接": f"https://www.douyin.com/user/{user['sec_uid']}" if user.get("sec_uid") else "",
-                "用户抖音号": user.get("unique_id", "未知"),
-                "用户签名": user.get("signature", "未知"),
-                "回复的评论ID": reply_id,
-                "具体的回复对象": reply_to_reply_id if reply_to_reply_id != "0" else reply_id,
-                "回复给谁": c.get("reply_to_username"),
-                "ip归属": c.get("ip_label", "未知")
-            }
-            data.append(item)
-        except KeyError as e:
-            skipped.append({"error": f"Missing key: {e}", "raw_data": c})
-        except Exception as e:
-            skipped.append({"error": str(e), "raw_data": c})
-
-    buffer.extend(data)
-    skipped_buffer.extend(skipped)
+    for i, c in enumerate(replies):
+        record = _safe_extract_reply(c, i)
+        if record is not None:
+            buffer.append(record)
+        else:
+            logger.warning("回复数据不完整，已跳过 (comment_id=%s, reply_index=%d)", comment_id, i)
 
     # 如果缓冲区数据达到批量保存的阈值，保存到文件
     if len(buffer) >= batch_size:
@@ -111,21 +138,6 @@ def save_replies_and_progress(replies: list, output_file: str, progress_file: st
         # 同时更新进度文件
         with open(progress_file, "a") as f:
             f.write(comment_id + "\n")
-            
-        if skipped_buffer:
-            skipped_file = os.path.join(os.path.dirname(output_file), "skipped_replies.json")
-            if os.path.exists(skipped_file):
-                with open(skipped_file, "r", encoding="utf-8") as f:
-                    try:
-                        existing_skipped = json.load(f)
-                    except json.JSONDecodeError:
-                        existing_skipped = []
-            else:
-                existing_skipped = []
-            existing_skipped.extend(skipped_buffer)
-            with open(skipped_file, "w", encoding="utf-8") as f:
-                json.dump(existing_skipped, f, ensure_ascii=False, indent=2)
-            skipped_buffer.clear()
 
         return True
 
@@ -137,7 +149,6 @@ def finalize_buffer_and_progress(output_file: str, progress_file: str, comment_i
     在程序结束时，将缓冲区剩余的回复数据写入文件，同时写入进度文件。
     """
     global buffer
-    global skipped_buffer
 
     if buffer:
         df = pd.DataFrame(buffer)
@@ -147,21 +158,6 @@ def finalize_buffer_and_progress(output_file: str, progress_file: str, comment_i
             existing_data = pd.read_csv(output_file)
             df = pd.concat([existing_data, df]).drop_duplicates(subset=["评论ID"])
         df.to_csv(output_file, mode='w', index=False)
-
-    if skipped_buffer:
-        skipped_file = os.path.join(os.path.dirname(output_file), "skipped_replies.json")
-        if os.path.exists(skipped_file):
-            with open(skipped_file, "r", encoding="utf-8") as f:
-                try:
-                    existing_skipped = json.load(f)
-                except json.JSONDecodeError:
-                    existing_skipped = []
-        else:
-            existing_skipped = []
-        existing_skipped.extend(skipped_buffer)
-        with open(skipped_file, "w", encoding="utf-8") as f:
-            json.dump(existing_skipped, f, ensure_ascii=False, indent=2)
-        skipped_buffer.clear()
 
     if comment_id_list:
         with open(progress_file, "a") as f:
@@ -194,7 +190,6 @@ async def main():
 
 
 buffer = []
-skipped_buffer = []
 batch_size = 10
 aweme_id = input("Enter the aweme_id: ")
 base_dir = f"data/{aweme_id}"
