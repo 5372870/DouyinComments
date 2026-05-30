@@ -1,9 +1,8 @@
-import abc
 import hashlib
 import random
 import re
 import urllib.parse
-from pathlib import Path
+from abc import ABC, abstractmethod
 
 import cookiesparser
 import execjs
@@ -13,86 +12,6 @@ HOST = 'https://www.douyin.com'
 WEBID_URL = 'https://www.douyin.com/?recommend=1'
 REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
 WEBID_PATTERN = re.compile(r'(?:\\"user_unique_id\\":\\"(\d+)\\"|"user_unique_id"\s*:\s*"(\d+)")')
-_SIGNER = None
-_DEFAULT_SIGNER = None
-
-
-class Signer(abc.ABC):
-    def sign(self, call_name: str, query: str, user_agent: str) -> str:
-        raise NotImplementedError
-
-
-class LocalJSSigner(Signer):
-    def __init__(self, js_path: str | Path | None = None):
-        if js_path is None:
-            js_path = Path(__file__).with_name('douyin.js')
-        self.js_path = Path(js_path)
-        self._ctx = None
-
-    @property
-    def ctx(self):
-        if self._ctx is None:
-            with self.js_path.open(encoding='utf-8') as f:
-                self._ctx = execjs.compile(f.read())
-        return self._ctx
-
-    def sign(self, call_name: str, query: str, user_agent: str) -> str:
-        return self.ctx.call(call_name, query, user_agent)
-
-
-class RemoteAPISigner(Signer):
-    def __init__(
-        self,
-        endpoint: str,
-        session: requests.Session | None = None,
-        timeout: float = 10,
-        response_field: str = 'a_bogus',
-    ):
-        self.endpoint = endpoint
-        self.session = session or requests.Session()
-        self.timeout = timeout
-        self.response_field = response_field
-
-    def sign(self, call_name: str, query: str, user_agent: str) -> str:
-        response = self.session.post(
-            self.endpoint,
-            json={
-                'call_name': call_name,
-                'query': query,
-                'user_agent': user_agent,
-            },
-            timeout=self.timeout,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        value = payload.get(self.response_field)
-        if value is None:
-            raise ValueError(f'missing signer response field: {self.response_field}')
-        return str(value)
-
-
-class MockSigner(Signer):
-    def __init__(self, return_value: str = 'mock_a_bogus'):
-        self.return_value = return_value
-        self.calls: list[dict[str, str]] = []
-
-    def sign(self, call_name: str, query: str, user_agent: str) -> str:
-        self.calls.append(
-            {
-                'call_name': call_name,
-                'query': query,
-                'user_agent': user_agent,
-            }
-        )
-        return self.return_value
-
-
-class _LegacyDouyinSign:
-    def call(self, call_name: str, query: str, user_agent: str) -> str:
-        return get_default_signer().sign(call_name, query, user_agent)
-
-
-DOUYIN_SIGN = _LegacyDouyinSign()
 
 COMMON_PARAMS = {
     'device_platform': 'webapp',
@@ -150,24 +69,92 @@ class WebIdRedirectError(RuntimeError):
         super().__init__(message)
 
 
-def get_default_signer() -> Signer:
-    global _DEFAULT_SIGNER
-    if _DEFAULT_SIGNER is None:
-        _DEFAULT_SIGNER = LocalJSSigner()
-    return _DEFAULT_SIGNER
+class Signer(ABC):
+    @abstractmethod
+    def sign(self, query: str, user_agent: str) -> str:
+        raise NotImplementedError
+
+    def sign_detail(self, query: str, user_agent: str) -> str:
+        return self.sign(query, user_agent)
+
+    def sign_reply(self, query: str, user_agent: str) -> str:
+        return self.sign(query, user_agent)
 
 
-def set_default_signer(signer: Signer | None) -> None:
-    global _DEFAULT_SIGNER, _SIGNER
-    _DEFAULT_SIGNER = signer
-    _SIGNER = signer._ctx if isinstance(signer, LocalJSSigner) else None
+class LocalJSSigner(Signer):
+    def __init__(self, js_path: str = 'douyin.js'):
+        self._js_path = js_path
+        self._compiled = None
+
+    def _get_compiled(self):
+        if self._compiled is None:
+            with open(self._js_path, encoding='utf-8') as f:
+                self._compiled = execjs.compile(f.read())
+        return self._compiled
+
+    def sign(self, query: str, user_agent: str) -> str:
+        return self._get_compiled().call('sign_datail', query, user_agent)
+
+    def sign_reply(self, query: str, user_agent: str) -> str:
+        return self._get_compiled().call('sign_reply', query, user_agent)
 
 
-def get_signer():
-    global _SIGNER
-    if _SIGNER is None:
-        _SIGNER = execjs.compile(open('douyin.js', encoding='utf-8').read())
-    return _SIGNER
+class MockSigner(Signer):
+    def __init__(self, a_bogus: str = "mock_a_bogus_value"):
+        self._a_bogus = a_bogus
+
+    def sign(self, query: str, user_agent: str) -> str:
+        return self._a_bogus
+
+    def sign_reply(self, query: str, user_agent: str) -> str:
+        return self._a_bogus
+
+
+class RemoteSigner(Signer):
+    def __init__(self, endpoint: str, api_key: str | None = None):
+        self._endpoint = endpoint
+        self._api_key = api_key
+
+    def sign(self, query: str, user_agent: str) -> str:
+        headers = {}
+        if self._api_key:
+            headers['Authorization'] = f'Bearer {self._api_key}'
+        response = requests.post(
+            self._endpoint,
+            json={'query': query, 'userAgent': user_agent},
+            headers=headers,
+            timeout=30
+        )
+        response.raise_for_status()
+        return response.json()['a_bogus']
+
+    def sign_reply(self, query: str, user_agent: str) -> str:
+        headers = {}
+        if self._api_key:
+            headers['Authorization'] = f'Bearer {self._api_key}'
+        response = requests.post(
+            self._endpoint,
+            json={'query': query, 'userAgent': user_agent, 'type': 'reply'},
+            headers=headers,
+            timeout=30
+        )
+        response.raise_for_status()
+        return response.json()['a_bogus']
+
+
+_signer: Signer | None = None
+
+
+def get_signer() -> Signer:
+    global _signer
+    if _signer is None:
+        _signer = LocalJSSigner()
+    return _signer
+
+
+def set_signer(signer: Signer) -> None:
+    global _signer
+    _signer = signer
 
 
 def extract_webid(response_text: str) -> str | None:
@@ -257,24 +244,15 @@ def get_ms_token(randomlength=120):
     return random_str
 
 
-def resolve_sign_call_name(uri: str) -> str:
-    if 'reply' in uri:
-        return 'sign_reply'
-    return 'sign_datail'
-
-
-def build_sign_query(params: dict) -> str:
-    return '&'.join([f'{key}={urllib.parse.quote(str(value))}' for key, value in params.items()])
-
-
-def sign_request(uri: str, params: dict, headers: dict, signer: Signer | None = None) -> str:
-    active_signer = signer or get_default_signer()
-    return active_signer.sign(resolve_sign_call_name(uri), build_sign_query(params), headers['User-Agent'])
-
-
-def common(uri, params: dict, headers: dict, signer: Signer | None = None) -> tuple[dict, dict]:
+def common(uri, params: dict, headers: dict) -> tuple[dict, dict]:
     params.update(COMMON_PARAMS)
     headers.update(COMMON_HEADERS)
     params = deal_params(params, headers)
-    params['a_bogus'] = sign_request(uri, params, headers, signer=signer)
+    query = '&'.join([f'{k}={urllib.parse.quote(str(v))}' for k, v in params.items()])
+    signer = get_signer()
+    if 'reply' in uri:
+        a_bogus = signer.sign_reply(query, headers["User-Agent"])
+    else:
+        a_bogus = signer.sign_detail(query, headers["User-Agent"])
+    params['a_bogus'] = a_bogus
     return params, headers
