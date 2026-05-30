@@ -1,0 +1,189 @@
+diff --git a/common.py b/common.py
+index 1b239fe..88f1644 100644
+--- a/common.py
++++ b/common.py
+@@ -3,57 +3,96 @@ import hashlib
+ import random
+ import re
+ import urllib.parse
++from pathlib import Path
+ 
+ import cookiesparser
+ import execjs
+ import requests
+ 
++HOST = 'https://www.douyin.com'
++WEBID_URL = 'https://www.douyin.com/?recommend=1'
++REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
++WEBID_PATTERN = re.compile(r'(?:\\"user_unique_id\\":\\"(\d+)\\"|"user_unique_id"\s*:\s*"(\d+)")')
++_SIGNER = None
++_DEFAULT_SIGNER = None
++
++
+ class Signer(abc.ABC):
+-    """Abstract base class for Douyin signature logic."""
+-    @abc.abstractmethod
+     def sign(self, call_name: str, query: str, user_agent: str) -> str:
+-        pass
++        raise NotImplementedError
++
+ 
+ class LocalJSSigner(Signer):
+-    """Signer implementation using local JS file and execjs."""
+-    def __init__(self, js_path: str = 'douyin.js'):
+-        self.js_path = js_path
++    def __init__(self, js_path: str | Path | None = None):
++        if js_path is None:
++            js_path = Path(__file__).with_name('douyin.js')
++        self.js_path = Path(js_path)
+         self._ctx = None
+ 
+     @property
+     def ctx(self):
+         if self._ctx is None:
+-            with open(self.js_path, encoding='utf-8') as f:
++            with self.js_path.open(encoding='utf-8') as f:
+                 self._ctx = execjs.compile(f.read())
+         return self._ctx
+ 
+     def sign(self, call_name: str, query: str, user_agent: str) -> str:
+         return self.ctx.call(call_name, query, user_agent)
+ 
++
+ class RemoteAPISigner(Signer):
+-    """Signer implementation using a remote API service."""
+-    def __init__(self, api_url: str):
+-        self.api_url = api_url
++    def __init__(
++        self,
++        endpoint: str,
++        session: requests.Session | None = None,
++        timeout: float = 10,
++        response_field: str = 'a_bogus',
++    ):
++        self.endpoint = endpoint
++        self.session = session or requests.Session()
++        self.timeout = timeout
++        self.response_field = response_field
+ 
+     def sign(self, call_name: str, query: str, user_agent: str) -> str:
+-        response = requests.post(self.api_url, json={
+-            'call_name': call_name,
+-            'query': query,
+-            'user_agent': user_agent
+-        })
++        response = self.session.post(
++            self.endpoint,
++            json={
++                'call_name': call_name,
++                'query': query,
++                'user_agent': user_agent,
++            },
++            timeout=self.timeout,
++        )
+         response.raise_for_status()
+-        return response.json().get('a_bogus', '')
++        payload = response.json()
++        value = payload.get(self.response_field)
++        if value is None:
++            raise ValueError(f'missing signer response field: {self.response_field}')
++        return str(value)
++
+ 
+ class MockSigner(Signer):
+-    """Mock signer for testing purposes."""
++    def __init__(self, return_value: str = 'mock_a_bogus'):
++        self.return_value = return_value
++        self.calls: list[dict[str, str]] = []
++
+     def sign(self, call_name: str, query: str, user_agent: str) -> str:
+-        return "mock_a_bogus_signature"
++        self.calls.append(
++            {
++                'call_name': call_name,
++                'query': query,
++                'user_agent': user_agent,
++            }
++        )
++        return self.return_value
+ 
+-HOST = 'https://www.douyin.com'
+-WEBID_URL = 'https://www.douyin.com/?recommend=1'
+-REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
+-WEBID_PATTERN = re.compile(r'(?:\\"user_unique_id\\":\\"(\d+)\\"|"user_unique_id"\s*:\s*"(\d+)")')
+-_SIGNER = None
++
++class _LegacyDouyinSign:
++    def call(self, call_name: str, query: str, user_agent: str) -> str:
++        return get_default_signer().sign(call_name, query, user_agent)
++
++
++DOUYIN_SIGN = _LegacyDouyinSign()
+ 
+ COMMON_PARAMS = {
+     'device_platform': 'webapp',
+@@ -111,16 +150,25 @@ class WebIdRedirectError(RuntimeError):
+         super().__init__(message)
+ 
+ 
+-def get_signer() -> Signer:
++def get_default_signer() -> Signer:
++    global _DEFAULT_SIGNER
++    if _DEFAULT_SIGNER is None:
++        _DEFAULT_SIGNER = LocalJSSigner()
++    return _DEFAULT_SIGNER
++
++
++def set_default_signer(signer: Signer | None) -> None:
++    global _DEFAULT_SIGNER, _SIGNER
++    _DEFAULT_SIGNER = signer
++    _SIGNER = signer._ctx if isinstance(signer, LocalJSSigner) else None
++
++
++def get_signer():
+     global _SIGNER
+     if _SIGNER is None:
+-        _SIGNER = LocalJSSigner()
++        _SIGNER = execjs.compile(open('douyin.js', encoding='utf-8').read())
+     return _SIGNER
+ 
+-def set_signer(signer: Signer):
+-    global _SIGNER
+-    _SIGNER = signer
+-
+ 
+ def extract_webid(response_text: str) -> str | None:
+     if not response_text:
+@@ -209,16 +257,24 @@ def get_ms_token(randomlength=120):
+     return random_str
+ 
+ 
++def resolve_sign_call_name(uri: str) -> str:
++    if 'reply' in uri:
++        return 'sign_reply'
++    return 'sign_datail'
++
++
++def build_sign_query(params: dict) -> str:
++    return '&'.join([f'{key}={urllib.parse.quote(str(value))}' for key, value in params.items()])
++
++
++def sign_request(uri: str, params: dict, headers: dict, signer: Signer | None = None) -> str:
++    active_signer = signer or get_default_signer()
++    return active_signer.sign(resolve_sign_call_name(uri), build_sign_query(params), headers['User-Agent'])
++
++
+ def common(uri, params: dict, headers: dict, signer: Signer | None = None) -> tuple[dict, dict]:
+     params.update(COMMON_PARAMS)
+     headers.update(COMMON_HEADERS)
+     params = deal_params(params, headers)
+-    query = '&'.join([f'{k}={urllib.parse.quote(str(v))}' for k, v in params.items()])
+-    call_name = 'sign_datail'
+-    if 'reply' in uri:
+-        call_name = 'sign_reply'
+-    
+-    actual_signer = signer or get_signer()
+-    a_bogus = actual_signer.sign(call_name, query, headers["User-Agent"])
+-    params['a_bogus'] = a_bogus
++    params['a_bogus'] = sign_request(uri, params, headers, signer=signer)
+     return params, headers
