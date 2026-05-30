@@ -1,23 +1,29 @@
-import requests
-import execjs
-import urllib.parse
-import re
+import hashlib
 import random
+import re
+import urllib.parse
+
 import cookiesparser
+import execjs
+import requests
 
 HOST = 'https://www.douyin.com'
+WEBID_URL = 'https://www.douyin.com/?recommend=1'
+REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
+WEBID_PATTERN = re.compile(r'(?:\\"user_unique_id\\":\\"(\d+)\\"|"user_unique_id"\s*:\s*"(\d+)")')
+_SIGNER = None
 
 COMMON_PARAMS = {
     'device_platform': 'webapp',
     'aid': '6383',
     'channel': 'channel_pc_web',
     'update_version_code': '170400',
-    'pc_client_type': '1',  # Windows
+    'pc_client_type': '1',
     'version_code': '190500',
     'version_name': '19.5.0',
     'cookie_enabled': 'true',
-    'screen_width': '2560',  # from cookie dy_swidth
-    'screen_height': '1440',  # from cookie dy_sheight
+    'screen_width': '2560',
+    'screen_height': '1440',
     'browser_language': 'zh-CN',
     'browser_platform': 'Win32',
     'browser_name': 'Chrome',
@@ -27,17 +33,12 @@ COMMON_PARAMS = {
     'engine_version': '126.0.0.0',
     'os_name': 'Windows',
     'os_version': '10',
-    'cpu_core_num': '24',  # device_web_cpu_core
-    'device_memory': '8',  # device_web_memory_size
+    'cpu_core_num': '24',
+    'device_memory': '8',
     'platform': 'PC',
     'downlink': '10',
     'effective_type': '4g',
     'round_trip_time': '50',
-    # 'webid': '7378325321550546458',   # from doc
-    # 'verifyFp': 'verify_lx6xgiix_cde2e4d7_7a43_e749_7cda_b5e7c149c780',   # from cookie s_v_web_id
-    # 'fp': 'verify_lx6xgiix_cde2e4d7_7a43_e749_7cda_b5e7c149c780', # from cookie s_v_web_id
-    # 'msToken': 'hfAykirauBE-RKDm8bF2o2_cKuSdwHsbGXjJBuo8s3w9n46-Tu0CtxX7-iiZWZ8D7mRUAmRAkeiaU35194AJehc9u6_mei3Q9s_LABQuoANQmbd81DDS3wuA5u9UVIo%3D',  # from cookie msToken
-    # 'a_bogus': 'xJRwQfLfDkdsgDyh54OLfY3q66M3YQnV0trEMD2f5V3WF639HMPh9exLx-TvU6DjNs%2FDIeEjy4haT3nprQVH8qw39W4x%2F2CgQ6h0t-P2so0j53iJCLgmE0hE4vj3SlF85XNAiOk0y7ICKY00AInymhK4bfebY7Y6i6tryE%3D%3D' # sign
 }
 
 COMMON_HEADERS = {
@@ -57,23 +58,74 @@ COMMON_HEADERS = {
     "dnt": "1",
 }
 
-DOUYIN_SIGN = execjs.compile(open('douyin.js', encoding='utf-8').read())
+
+class WebIdRedirectError(RuntimeError):
+    def __init__(self, status_code: int, location: str | None = None):
+        self.status_code = status_code
+        self.location = location
+        message = f'homepage request redirected with status {status_code}'
+        if location:
+            message = f'{message} to {location}'
+        super().__init__(message)
 
 
-def get_webid(headers: dict):
-    url = 'https://www.douyin.com/?recommend=1'
-    # print(f'url: {url}, request {url}, headers={headers}')
-    headers['sec-fetch-dest'] = 'document'
-    response = requests.get(url, headers=headers)
-    # print(f'url: {url}, response, code: {response.status_code}')
-    if response.status_code != 200 or response.text == '':
-        # print(f'failed get webid, url: {url}, header: {headers}')
+def get_signer():
+    global _SIGNER
+    if _SIGNER is None:
+        _SIGNER = execjs.compile(open('douyin.js', encoding='utf-8').read())
+    return _SIGNER
+
+
+def extract_webid(response_text: str) -> str | None:
+    if not response_text:
         return None
-    pattern = r'\\"user_unique_id\\":\\"(\d+)\\"'
-    match = re.search(pattern, response.text)
-    if match:
-        return match.group(1)
+    matches = [escaped_match or raw_match for escaped_match, raw_match in WEBID_PATTERN.findall(response_text)]
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def infer_webid_from_cookie(cookie_dict: dict) -> str | None:
+    direct_keys = ('webid', 'web_id', 'web_id_str')
+    for key in direct_keys:
+        value = str(cookie_dict.get(key) or '').strip()
+        if value.isdigit():
+            return value
+
+    seed_keys = ('s_v_web_id', 'verifyFp', 'ttwid', 'msToken')
+    for key in seed_keys:
+        value = str(cookie_dict.get(key) or '').strip()
+        if not value:
+            continue
+        digit_match = re.search(r'(\d{15,20})', value)
+        if digit_match:
+            return digit_match.group(1)
+        digest = hashlib.sha1(value.encode('utf-8')).hexdigest()
+        return str(int(digest, 16))[:19]
     return None
+
+
+def get_webid(headers: dict, cookie_dict: dict | None = None, max_retries: int = 2):
+    request_headers = headers.copy()
+    request_headers['sec-fetch-dest'] = 'document'
+    attempts = max(1, max_retries + 1)
+
+    for _ in range(attempts):
+        try:
+            response = requests.get(WEBID_URL, headers=request_headers, allow_redirects=False, timeout=10)
+        except requests.RequestException:
+            continue
+
+        if response.status_code in REDIRECT_STATUS_CODES:
+            raise WebIdRedirectError(response.status_code, response.headers.get('Location'))
+
+        if response.status_code == 200:
+            webid = extract_webid(response.text)
+            if webid:
+                return webid
+
+    return infer_webid_from_cookie(cookie_dict or {})
+
 
 def deal_params(params: dict, headers: dict) -> dict:
     cookie = headers.get('cookie') or headers.get('Cookie')
@@ -85,16 +137,24 @@ def deal_params(params: dict, headers: dict) -> dict:
     params['screen_height'] = cookie_dict.get('dy_sheight', 1440)
     params['cpu_core_num'] = cookie_dict.get('device_web_cpu_core', 24)
     params['device_memory'] = cookie_dict.get('device_web_memory_size', 8)
-    params['verifyFp'] = cookie_dict.get('s_v_web_id', None)
-    params['fp'] = cookie_dict.get('s_v_web_id', None)
-    params['webid'] = get_webid(headers)
+
+    verify_fp = cookie_dict.get('s_v_web_id')
+    if verify_fp:
+        params['verifyFp'] = verify_fp
+        params['fp'] = verify_fp
+    else:
+        params.pop('verifyFp', None)
+        params.pop('fp', None)
+
+    webid = get_webid(headers, cookie_dict=cookie_dict)
+    if webid:
+        params['webid'] = webid
+    else:
+        params.pop('webid', None)
     return params
 
 
 def get_ms_token(randomlength=120):
-    """
-    根据传入长度产生随机字符串
-    """
     random_str = ''
     base_str = 'ABCDEFGHIGKLMNOPQRSTUVWXYZabcdefghigklmnopqrstuvwxyz0123456789='
     length = len(base_str) - 1
@@ -111,6 +171,6 @@ def common(uri, params: dict, headers: dict) -> tuple[dict, dict]:
     call_name = 'sign_datail'
     if 'reply' in uri:
         call_name = 'sign_reply'
-    a_bogus = DOUYIN_SIGN.call(call_name, query, headers["User-Agent"])
-    params["a_bogus"] = a_bogus
+    a_bogus = get_signer().call(call_name, query, headers["User-Agent"])
+    params['a_bogus'] = a_bogus
     return params, headers
